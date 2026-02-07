@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from ultralytics.nn.modules.block import CBAM, ECA  # Add this line
+from ultralytics.nn.modules.block import CBAM
+from ultralytics.nn.modules.block import ECABlock  # Add this line
 
 import contextlib
 import pickle
@@ -1663,7 +1664,7 @@ def parse_model(d, ch, verbose=True):
         elif m is CBAM:                  # <--- ADD THIS BLOCK
             c2 = ch[f]                   # Output channels = Input channels
             args = [ch[f], *args]
-        elif m is ECA:
+        elif m is ECABlock:
             c2 = ch[f]             # Output channels = Input channels
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):
