@@ -2117,9 +2117,10 @@ import torch
 from torch import nn
 
 class ECABlock(nn.Module):
-    def __init__(self, c1, c2, gamma=2, b=1):
+    # Ensure c1 and c2 are both present in the arguments
+    def __init__(self, c1, c2, gamma=2, b=1): 
         super(ECABlock, self).__init__()
-        # c1 is input channels, c2 is output channels (usually c1 == c2 for ECA)
+        # Use c1 (input channels) to calculate the adaptive kernel size k
         t = int(abs((torch.log2(torch.tensor(c1, dtype=torch.float32)) / gamma) + (b / gamma)))
         k = t if t % 2 else t + 1
         
@@ -2128,7 +2129,9 @@ class ECABlock(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        y = self.avg_pool(x)
+        # x shape: [Batch, Channels, H, W]
+        y = self.avg_pool(x) # [B, C, 1, 1]
+        # Squeeze and transpose for 1D convolution across channels
         y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
         y = self.sigmoid(y)
         return x * y.expand_as(x)
