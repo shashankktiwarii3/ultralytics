@@ -1,8 +1,5 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from ultralytics.nn.modules.block import CBAM
-from ultralytics.nn.modules.block import ECABlock  # Add this line
-
 import contextlib
 import pickle
 import re
@@ -12,6 +9,8 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+from ultralytics.nn.modules.block import ECA
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1571,6 +1570,7 @@ def parse_model(d, ch, verbose=True):
         {
             Classify,
             Conv,
+            ECA,
             ConvTranspose,
             GhostConv,
             Bottleneck,
@@ -1622,6 +1622,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
+            ECA
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1660,12 +1661,6 @@ def parse_model(d, ch, verbose=True):
             if m is C2fCIB:
                 legacy = False
         elif m is AIFI:
-            args = [ch[f], *args]
-        elif m is CBAM:                  # <--- ADD THIS BLOCK
-            c2 = ch[f]                   # Output channels = Input channels
-            args = [ch[f], *args]
-        elif m is ECABlock:
-            c2 = ch[f]             # Output channels = Input channels
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]

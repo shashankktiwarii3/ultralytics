@@ -6,7 +6,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -2066,72 +2065,20 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
-
-import torch
-import torch.nn as nn
-
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
-        padding = 3 if kernel_size == 7 else 1
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x_cat = torch.cat([avg_out, max_out], dim=1)
-        out = self.conv1(x_cat)
-        return self.sigmoid(out)
-
-class CBAM(nn.Module):
-    def __init__(self, c1, kernel_size=7):  # c1 = input channels
-        super(CBAM, self).__init__()
-        self.channel_attention = ChannelAttention(c1)
-        self.spatial_attention = SpatialAttention(kernel_size)
-
-    def forward(self, x):
-        out = self.channel_attention(x) * x
-        out = self.spatial_attention(out) * out
-        return out
-    
-
 import torch
 from torch import nn
 
-class ECABlock(nn.Module):
-    # Ensure c1 and c2 are both present in the arguments
-    def __init__(self, c1, c2, gamma=2, b=1): 
-        super(ECABlock, self).__init__()
-        # Use c1 (input channels) to calculate the adaptive kernel size k
-        t = int(abs((torch.log2(torch.tensor(c1, dtype=torch.float32)) / gamma) + (b / gamma)))
-        k = t if t % 2 else t + 1
-        
+class ECA(nn.Module):
+    # Standard YOLO constructor signature: (in_channels, out_channels, repeats, ...)
+    def __init__(self, c1, c2, n=1, k_size=3):
+        super().__init__()
+        # In ECA, usually c1 == c2. We use c2 for the internal logic.
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # x shape: [Batch, Channels, H, W]
-        y = self.avg_pool(x) # [B, C, 1, 1]
-        # Squeeze and transpose for 1D convolution across channels
+        y = self.avg_pool(x)
         y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
         y = self.sigmoid(y)
         return x * y.expand_as(x)
