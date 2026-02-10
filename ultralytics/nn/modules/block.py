@@ -2089,6 +2089,8 @@ import torch.nn as nn
 class CoordinationAttention(nn.Module):
     def __init__(self, c1, c2, n=1, reduction=32):
         super().__init__()
+        # Coordination Attention is a refinement block; c1 must equal c2
+        # If they aren't equal in YAML, we force the attention to match the input c1
         self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
         self.pool_w = nn.AdaptiveAvgPool2d((1, None))
 
@@ -2096,16 +2098,16 @@ class CoordinationAttention(nn.Module):
 
         self.conv1 = nn.Conv2d(c1, mip, kernel_size=1, stride=1, padding=0)
         self.bn1 = nn.BatchNorm2d(mip)
-        self.act = nn.SiLU() # Using SiLU to match YOLO26/v8 default
+        self.act = nn.SiLU()
 
-        self.conv_h = nn.Conv2d(mip, c2, kernel_size=1, stride=1, padding=0)
-        self.conv_w = nn.Conv2d(mip, c2, kernel_size=1, stride=1, padding=0)
+        # These must output the same number of channels as the input (c1)
+        self.conv_h = nn.Conv2d(mip, c1, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, c1, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x):
         identity = x
         n, c, h, w = x.size()
 
-        # Coordinate pooling
         x_h = self.pool_h(x)
         x_w = self.pool_w(x).permute(0, 1, 3, 2)
 
