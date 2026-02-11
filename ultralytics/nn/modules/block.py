@@ -2097,7 +2097,7 @@ class CoordinationAttention(nn.Module):
         mip = max(8, c1 // reduction)
 
         self.conv1 = nn.Conv2d(c1, mip, kernel_size=1, stride=1, padding=0)
-        self.bn1 = nn.BatchNorm2d(mip)
+        self.bn1 = nn.GroupNorm(mip)
         self.act = nn.SiLU()
 
         # These must output the same number of channels as the input (c1)
