@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 
-from ultralytics.nn.modules.block import ECA, CoordinationAttention, CBAMLite, CBAM, SpatialAttention, ChannelAttention
+from ultralytics.nn.modules.block import ECA, CoordinationAttention, CBAM, SpatialAttention, ChannelAttention
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1573,7 +1573,7 @@ def parse_model(d, ch, verbose=True):
             Conv,
             ECA,
             CoordinationAttention,
-            CBAMLite, 
+       
             CBAM, 
             SpatialAttention, 
             ChannelAttention,
@@ -1632,7 +1632,7 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
             ECA,
             CoordinationAttention,
-            CBAMLite, 
+      
             CBAM, 
             SpatialAttention, 
             ChannelAttention,
