@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 
-from ultralytics.nn.modules.block import ECA, CoordinationAttention, CBAM, SpatialAttention, ChannelAttention
+from ultralytics.nn.modules.block import ECA, CoordinationAttention, CBAM, SpatialAttention, ChannelAttention, SwinStage,SwinStageLite,SwinTransformerBlock,WindowAttention
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1577,7 +1577,10 @@ def parse_model(d, ch, verbose=True):
             CBAM, 
             SpatialAttention, 
             ChannelAttention,
-            
+            SwinStage,
+            SwinStageLite,
+            SwinTransformerBlock,
+            WindowAttention,
 
             ConvTranspose,
             GhostConv,
@@ -1636,7 +1639,10 @@ def parse_model(d, ch, verbose=True):
             CBAM, 
             SpatialAttention, 
             ChannelAttention,
-            
+            SwinStage,
+            SwinStageLite,
+            SwinTransformerBlock,
+            WindowAttention,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args

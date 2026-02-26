@@ -2161,87 +2161,313 @@ import torch
 import torch.nn as nn
 
 class ChannelAttention(nn.Module):
-    """Channel Attention Module for CBAM"""
-    def __init__(self, channels, reduction=16):
-        super().__init__()
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
-        
-        # Shared MLP
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False)
-        )
+        # Using 1x1 convolutions instead of linear layers to handle varying spatial dimensions
+        self.fc1   = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2   = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
         self.sigmoid = nn.Sigmoid()
-        
+
     def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
         out = avg_out + max_out
         return self.sigmoid(out)
 
-
 class SpatialAttention(nn.Module):
-    """Spatial Attention Module for CBAM"""
     def __init__(self, kernel_size=7):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
         self.sigmoid = nn.Sigmoid()
-        
+
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
-        out = torch.cat([avg_out, max_out], dim=1)
-        out = self.conv(out)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv1(x_cat)
         return self.sigmoid(out)
 
-
 class CBAM(nn.Module):
-    """
-    Convolutional Block Attention Module (CBAM)
-    Compatible with Ultralytics YOLO architecture
-    Paper: https://arxiv.org/abs/1807.06521
-    """
-    def __init__(self, c1, c2=None, reduction=16, kernel_size=7):
-        """
-        Args:
-            c1 (int): Input channels (auto-passed by Ultralytics)
-            c2 (int): Output channels (auto-passed, typically same as c1)
-            reduction (int): Channel reduction ratio for channel attention
-            kernel_size (int): Kernel size for spatial attention convolution
-        """
-        super().__init__()
-        # c2 is typically the same as c1 for attention modules
-        self.channel_attention = ChannelAttention(c1, reduction)
+    # c1 is input channels, c2 is output channels (kept identical for Ultralytics parser)
+    def __init__(self, c1, c2=None, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttention(c1, ratio)
         self.spatial_attention = SpatialAttention(kernel_size)
-        
+
     def forward(self, x):
-        # Apply channel attention
-        x = x * self.channel_attention(x)
-        # Apply spatial attention
-        x = x * self.spatial_attention(x)
+        out = self.channel_attention(x) * x
+        out = self.spatial_attention(out) * out
+        return out
+    
+
+import torch
+import torch.nn as nn
+import numpy as np
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+
+
+def window_partition(x, window_size):
+    """
+    Partition feature map into windows
+    Args:
+        x: (B, H, W, C)
+        window_size: window size
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W):
+    """
+    Reverse window partition
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size: Window size
+        H: Height of image
+        W: Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+class WindowAttention(nn.Module):
+    """
+    Window based multi-head self attention (W-MSA) with relative position bias
+    """
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        # Relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
+        )
+
+        # Get pair-wise relative position index
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += self.window_size[0] - 1
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1
+        )
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
         return x
 
 
-class CBAMLite(nn.Module):
+class SwinTransformerBlock(nn.Module):
     """
-    Lightweight CBAM with smaller kernel for faster inference
-    Recommended for small models
+    Swin Transformer Block
     """
-    def __init__(self, c1, c2=None, reduction=16, kernel_size=3):
+    def __init__(self, dim, num_heads, window_size=7, shift_size=0,
+                 mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention(
+            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
+            qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop
+        )
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            act_layer(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop)
+        )
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1).contiguous()  # B, H, W, C
+
+        shortcut = x
+        x = self.norm1(x)
+
+        # Pad feature maps to multiples of window size
+        pad_l = pad_t = 0
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        x = nn.functional.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
+        _, Hp, Wp, _ = x.shape
+
+        # Cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            attn_mask = None  # For simplicity, implement mask if needed
+        else:
+            shifted_x = x
+            attn_mask = None
+
+        # Partition windows
+        x_windows = window_partition(shifted_x, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=attn_mask)
+
+        # Merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)
+
+        # Reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+
+        if pad_r > 0 or pad_b > 0:
+            x = x[:, :H, :W, :].contiguous()
+
+        # FFN
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        x = x.permute(0, 3, 1, 2).contiguous()  # B, C, H, W
+        return x
+
+
+class SwinStage(nn.Module):
+    """
+    Swin Transformer Stage - Compatible with Ultralytics YOLO
+    Simplified for YOLO integration
+    """
+    def __init__(self, c1, c2=None, num_heads=4, window_size=7, num_blocks=2):
         """
         Args:
-            c1 (int): Input channels
-            c2 (int): Output channels (typically same as c1)
-            reduction (int): Channel reduction ratio
-            kernel_size (int): Kernel size (3 for lite version)
+            c1: Input channels (auto-passed by Ultralytics)
+            c2: Output channels (if None, same as c1)
+            num_heads: Number of attention heads
+            window_size: Window size for attention
+            num_blocks: Number of Swin blocks
         """
         super().__init__()
-        self.channel_attention = ChannelAttention(c1, reduction)
-        self.spatial_attention = SpatialAttention(kernel_size)
+        c2 = c2 or c1
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(
+                dim=c1,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                mlp_ratio=4.0,
+                qkv_bias=True,
+                drop=0.,
+                attn_drop=0.,
+                drop_path=0.1 * i / num_blocks
+            )
+            for i in range(num_blocks)
+        ])
         
+        # Channel adjustment if needed
+        self.proj = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
+
     def forward(self, x):
-        x = x * self.channel_attention(x)
-        x = x * self.spatial_attention(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.proj(x)
+        return x
+
+
+class SwinStageLite(nn.Module):
+    """
+    Lightweight Swin Transformer Stage for small models
+    Reduced heads and window size for efficiency
+    """
+    def __init__(self, c1, c2=None, num_heads=2, window_size=4, num_blocks=1):
+        """
+        Args:
+            c1: Input channels
+            c2: Output channels (if None, same as c1)
+            num_heads: Number of attention heads (2 for lite)
+            window_size: Window size (4 for lite)
+            num_blocks: Number of blocks (1 for lite)
+        """
+        super().__init__()
+        c2 = c2 or c1
+        self.blocks = nn.ModuleList([
+            SwinTransformerBlock(
+                dim=c1,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=0 if (i % 2 == 0) else window_size // 2,
+                mlp_ratio=2.0,  # Reduced MLP ratio
+                qkv_bias=True,
+                drop=0.,
+                attn_drop=0.,
+                drop_path=0.
+            )
+            for i in range(num_blocks)
+        ])
+        
+        self.proj = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        x = self.proj(x)
         return x
