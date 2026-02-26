@@ -1676,6 +1676,9 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is CBAM:
+            c1, c2 = ch[f], ch[f] # Input and output channels are identical
+            args = [c1, *args]    # Pass c1 to the module initialization
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
