@@ -2156,21 +2156,22 @@ class GEFABlock(nn.Module):
     def forward(self, x):
         x = self.act(self.bn(self.conv(x)))
         return x * self.att(x)
+
 import torch
 import torch.nn as nn
 
 class ChannelAttention(nn.Module):
     """Channel Attention Module for CBAM"""
-    def __init__(self, in_channels, reduction=16):
+    def __init__(self, channels, reduction=16):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
         
         # Shared MLP
         self.fc = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction, 1, bias=False),
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // reduction, in_channels, 1, bias=False)
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
         )
         self.sigmoid = nn.Sigmoid()
         
@@ -2198,31 +2199,46 @@ class SpatialAttention(nn.Module):
 
 class CBAM(nn.Module):
     """
-    Convolutional Block Attention Module
+    Convolutional Block Attention Module (CBAM)
+    Compatible with Ultralytics YOLO architecture
     Paper: https://arxiv.org/abs/1807.06521
-    Combines channel and spatial attention sequentially
     """
-    def __init__(self, in_channels, reduction=16, kernel_size=7):
+    def __init__(self, c1, c2=None, reduction=16, kernel_size=7):
+        """
+        Args:
+            c1 (int): Input channels (auto-passed by Ultralytics)
+            c2 (int): Output channels (auto-passed, typically same as c1)
+            reduction (int): Channel reduction ratio for channel attention
+            kernel_size (int): Kernel size for spatial attention convolution
+        """
         super().__init__()
-        self.channel_attention = ChannelAttention(in_channels, reduction)
+        # c2 is typically the same as c1 for attention modules
+        self.channel_attention = ChannelAttention(c1, reduction)
         self.spatial_attention = SpatialAttention(kernel_size)
         
     def forward(self, x):
-        # Channel attention
+        # Apply channel attention
         x = x * self.channel_attention(x)
-        # Spatial attention
+        # Apply spatial attention
         x = x * self.spatial_attention(x)
         return x
 
 
 class CBAMLite(nn.Module):
     """
-    Lightweight CBAM with reduced kernel size for faster inference
-    Recommended for small models like YOLO26s
+    Lightweight CBAM with smaller kernel for faster inference
+    Recommended for small models
     """
-    def __init__(self, in_channels, reduction=16, kernel_size=3):
+    def __init__(self, c1, c2=None, reduction=16, kernel_size=3):
+        """
+        Args:
+            c1 (int): Input channels
+            c2 (int): Output channels (typically same as c1)
+            reduction (int): Channel reduction ratio
+            kernel_size (int): Kernel size (3 for lite version)
+        """
         super().__init__()
-        self.channel_attention = ChannelAttention(in_channels, reduction)
+        self.channel_attention = ChannelAttention(c1, reduction)
         self.spatial_attention = SpatialAttention(kernel_size)
         
     def forward(self, x):
