@@ -10,7 +10,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ultralytics.nn.modules.block import ECA, CoordinationAttention, GEFABlock
+
+from ultralytics.nn.modules.block import ECA, CoordinationAttention, CBAMLite, CBAM, SpatialAttention, ChannelAttention
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1572,7 +1573,12 @@ def parse_model(d, ch, verbose=True):
             Conv,
             ECA,
             CoordinationAttention,
-            GEFABlock,
+            CBAMLite, 
+            CBAM, 
+            SpatialAttention, 
+            ChannelAttention,
+            
+
             ConvTranspose,
             GhostConv,
             Bottleneck,
@@ -1626,7 +1632,11 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
             ECA,
             CoordinationAttention,
-            GEFABlock
+            CBAMLite, 
+            CBAM, 
+            SpatialAttention, 
+            ChannelAttention,
+            
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
