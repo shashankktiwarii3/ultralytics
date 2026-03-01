@@ -2471,3 +2471,121 @@ class SwinStageLite(nn.Module):
             x = block(x)
         x = self.proj(x)
         return x
+    
+
+import torch
+import torch.nn as nn
+
+
+class SELayer(nn.Module):
+    """
+    Squeeze-and-Excitation Layer
+    Paper: https://arxiv.org/abs/1709.01507
+    Simple and effective channel attention mechanism
+    """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+class SELayerConv(nn.Module):
+    """
+    SE Layer with Conv instead of FC (faster, less parameters)
+    Recommended for deployment
+    """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y)
+        return x * y
+
+
+class SEBlock(nn.Module):
+    """
+    SE Block compatible with Ultralytics YOLO
+    Auto-handles channel dimensions from YOLO parser
+    """
+    def __init__(self, c1, c2=None, reduction=16):
+        """
+        Args:
+            c1 (int): Input channels (auto-passed by Ultralytics)
+            c2 (int): Output channels (typically same as c1)
+            reduction (int): Channel reduction ratio
+        """
+        super().__init__()
+        c2 = c2 or c1
+        self.se = SELayerConv(c1, reduction)
+        self.conv = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
+        
+    def forward(self, x):
+        x = self.se(x)
+        x = self.conv(x)
+        return x
+
+
+class SEBlockLite(nn.Module):
+    """
+    Ultra-lightweight SE Block with higher reduction ratio
+    Best for small models and edge devices
+    """
+    def __init__(self, c1, c2=None, reduction=32):
+        """
+        Args:
+            c1 (int): Input channels
+            c2 (int): Output channels (typically same as c1)
+            reduction (int): Channel reduction ratio (32 for lite)
+        """
+        super().__init__()
+        c2 = c2 or c1
+        # Ensure minimum bottleneck size
+        reduction = min(reduction, c1 // 4) if c1 >= 32 else 4
+        self.se = SELayerConv(c1, reduction)
+        self.conv = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
+        
+    def forward(self, x):
+        x = self.se(x)
+        x = self.conv(x)
+        return x
+
+
+class eSE(nn.Module):
+    """
+    Effective Squeeze-and-Excitation (eSE)
+    Even simpler - just 1x1 conv without reduction
+    Extremely fast for real-time applications
+    """
+    def __init__(self, c1, c2=None):
+        super().__init__()
+        c2 = c2 or c1
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv2d(c1, c1, 1)
+        self.sigmoid = nn.Sigmoid()
+        self.proj = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
+        
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.sigmoid(self.conv(y))
+        x = x * y
+        x = self.proj(x)
+        return x
