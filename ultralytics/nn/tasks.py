@@ -1703,7 +1703,10 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f], *args]
         elif m is CBAM:
             c1, c2 = ch[f], ch[f] # Input and output channels are identical
-            args = [c1, *args]    # Pass c1 to the module initialization
+            args = [c1, *args]
+        elif m is SEBlock:
+            c1, c2 = ch[f], ch[f]    # Force output channels to equal input channels (128 -> 128)
+            args = [c1, c2, *args]    # Pass c1 to the module initialization
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
