@@ -2521,27 +2521,37 @@ class SELayerConv(nn.Module):
         return x * y
 
 
+import torch.nn as nn
+
 class SEBlock(nn.Module):
     """
-    SE Block compatible with Ultralytics YOLO
-    Auto-handles channel dimensions from YOLO parser
+    Bulletproof SE Block for Ultralytics YOLO.
+    Ignores parser scaling/extra arguments and automatically adapts to input channels.
     """
-    def __init__(self, c1, c2=None, reduction=16):
-        """
-        Args:
-            c1 (int): Input channels (auto-passed by Ultralytics)
-            c2 (int): Output channels (typically same as c1)
-            reduction (int): Channel reduction ratio
-        """
+    # The *args and **kwargs act as a sponge to absorb the mystery "1" 
+    # and any scaled channels the YOLO parser tries to force into it.
+    def __init__(self, c1, c2=None, *args, **kwargs):
         super().__init__()
-        c2 = c2 or c1
-        self.se = SELayerConv(c1, reduction)
-        self.conv = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
         
+        # We completely ignore whatever 'c2' (like the scaled 8) the parser passes.
+        # Attention mechanisms must keep input channels == output channels.
+        reduction = 16
+        
+        # Safeguard: Ensure intermediate channels don't drop below 1
+        redu_channels = max(1, c1 // reduction)
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Sequential(
+            nn.Conv2d(c1, redu_channels, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(redu_channels, c1, 1, bias=False),
+            nn.Sigmoid()
+        )
+
     def forward(self, x):
-        x = self.se(x)
-        x = self.conv(x)
-        return x
+        y = self.avg_pool(x)
+        y = self.conv(y)
+        return x * y
 
 
 class SEBlockLite(nn.Module):
