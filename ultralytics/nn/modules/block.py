@@ -2605,58 +2605,42 @@ class eSE(nn.Module):
 import torch
 import torch.nn as nn
 
+import torch
+import torch.nn as nn
+
 class SimAM(nn.Module):
     """
-    Simple Parameter-Free Attention Module (SimAM)
+    SimAM: A Simple, Parameter-Free Attention Module
+    Bulletproof implementation for Ultralytics YOLO YAML parser.
     Paper: https://proceedings.mlr.press/v139/yang21o.html
-    ICML 2021
-    
-    Key Features:
-    - Zero learnable parameters
-    - Based on neuroscience energy function
-    - Extremely fast (no Conv/FC operations)
-    - Works for both channel and spatial attention simultaneously
     """
-    def __init__(self, c1=None, c2=None, e_lambda=1e-4):
-        """
-        Args:
-            c1 (int): Input channels (for compatibility, not used)
-            c2 (int): Output channels (for compatibility, not used)
-            e_lambda (float): Regularization parameter (default: 1e-4)
-        """
+    # The *args and **kwargs act as our sponge to absorb the scaled channels (c2)
+    # and any extra arguments (like n=1) the YOLO parser tries to inject.
+    def __init__(self, c1, c2=None, e_lambda=1e-4, *args, **kwargs):
         super().__init__()
-        self.act = nn.Sigmoid()
+        
+        # SimAM is parameter-free! It doesn't use c1 or c2 to build Conv layers.
+        # We just accept them to keep the YOLO parser happy.
         self.e_lambda = e_lambda
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        """
-        Forward pass using 3D attention energy function
-        
-        Energy function:
-        e_t(w_t, b_t, y, x_i) = (1/(M-1) * Σ(y_i - t)^2) + λ(w_t^2 + b_t^2)
-        
-        Where:
-        - t = w_t * x_i + b_t (linear transform)
-        - y_i are other neurons in the same channel
-        - M is total number of neurons on the channel
-        - λ is regularization term
-        """
         b, c, h, w = x.size()
-        n = w * h - 1  # Number of other neurons
         
-        # Calculate spatial variance
-        # x_minus_mu_square = (x_i - μ)^2
+        # Avoid division by zero if the feature map is ever 1x1
+        n = max(1, w * h - 1) 
+        
+        # Calculate (t - u)^2
         x_minus_mu_square = (x - x.mean(dim=[2, 3], keepdim=True)).pow(2)
         
-        # Energy function (normalized)
-        # y = 1 / (4 * (σ^2 + λ) + 0.5)
-        y = x_minus_mu_square / (
-            4 * (x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n + self.e_lambda)
-        ) + 0.5
+        # Calculate variance
+        v = x_minus_mu_square.sum(dim=[2, 3], keepdim=True) / n
         
-        # Apply attention
-        return x * self.act(y)
-
+        # Calculate energy function E_inv
+        E_inv = x_minus_mu_square / (4 * (v + self.e_lambda)) + 0.5
+        
+        # Return attended features
+        return x * self.sigmoid(E_inv)
 
 class SimAM_Fast(nn.Module):
     """
