@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 
-from ultralytics.nn.modules.block import ECA, CoordinationAttention, CBAM, SpatialAttention, ChannelAttention, SwinStage,SwinStageLite,SwinTransformerBlock,WindowAttention,  SELayer,SELayerConv,SEBlock,SEBlockLite,eSE,SimAM, GAM,GAMLite,GAM_v2,ChannelAttentionGAM,SpatialAttentionGAM
+from ultralytics.nn.modules.block import ECA, CoordinationAttention, CBAM, SpatialAttention, ChannelAttention, SwinStage,SwinStageLite,SwinTransformerBlock,WindowAttention,  SELayer,SELayerConv,SEBlock,SEBlockLite,eSE,SimAM, GAM
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1574,10 +1574,6 @@ def parse_model(d, ch, verbose=True):
             ECA,
             CoordinationAttention,
             GAM,
-            GAMLite,
-            GAM_v2,
-            ChannelAttentionGAM,
-            SpatialAttentionGAM,
             CBAM,
             SimAM, 
             SpatialAttention, 
@@ -1646,10 +1642,6 @@ def parse_model(d, ch, verbose=True):
             CoordinationAttention,
             SimAM,
             GAM,
-            GAMLite,
-            GAM_v2,
-            ChannelAttentionGAM,
-            SpatialAttentionGAM,
             CBAM, 
             SpatialAttention, 
             ChannelAttention,

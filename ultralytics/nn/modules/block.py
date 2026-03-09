@@ -2668,182 +2668,53 @@ class SimAM_Fast(nn.Module):
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-class ChannelAttentionGAM(nn.Module):
-    """
-    Channel Attention for GAM
-    Uses 3D permutation to preserve spatial information
-    """
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.channels = channels
-        self.reduction = reduction
-        
-        # MLP with cross-spatial learning
-        mid_channels = channels // reduction
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, mid_channels),
-            nn.GELU(),
-            nn.Linear(mid_channels, channels)
-        )
-        
-    def forward(self, x):
-        b, c, h, w = x.size()
-        
-        # Reshape: [B, C, H, W] -> [B, H*W, C]
-        # This preserves spatial relationships during channel attention
-        x_reshape = x.view(b, c, h * w).permute(0, 2, 1)  # [B, H*W, C]
-        
-        # Apply MLP on channel dimension
-        x_att = self.mlp(x_reshape)  # [B, H*W, C]
-        
-        # Reshape back: [B, H*W, C] -> [B, C, H, W]
-        x_att = x_att.permute(0, 2, 1).view(b, c, h, w)
-        
-        # Apply attention
-        return x * x_att.sigmoid()
-
-
-class SpatialAttentionGAM(nn.Module):
-    """
-    Spatial Attention for GAM
-    Uses grouped convolution to reduce parameters
-    """
-    def __init__(self, channels, reduction=16):
-        super().__init__()
-        self.channels = channels
-        
-        # Two-layer grouped convolution
-        self.conv1 = nn.Conv2d(channels, channels, 7, padding=3, groups=channels // reduction)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, 7, padding=3, groups=channels // reduction)
-        self.bn2 = nn.BatchNorm2d(channels)
-        
-    def forward(self, x):
-        # First convolution
-        att = self.conv1(x)
-        att = self.bn1(att)
-        
-        # Second convolution
-        att = self.conv2(att)
-        att = self.bn2(att)
-        
-        # Apply attention
-        return x * att.sigmoid()
-
 
 class GAM(nn.Module):
     """
-    Global Attention Mechanism
+    Global Attention Mechanism (GAM)
+    Bulletproof implementation for Ultralytics YOLO YAML parser.
     Paper: https://arxiv.org/abs/2112.05561
-    
-    Combines channel and spatial attention with information preservation
-    State-of-art CNN attention mechanism (2023)
-    
-    Key improvements over CBAM:
-    - 3D permutation preserves spatial info in channel attention
-    - Grouped convolution reduces parameters in spatial attention
-    - Better performance with similar or lower overhead
     """
-    def __init__(self, c1, c2=None, reduction=16):
-        """
-        Args:
-            c1 (int): Input channels
-            c2 (int): Output channels (typically same as c1)
-            reduction (int): Channel reduction ratio (default: 16)
-        """
+    def __init__(self, c1, c2=None, rate=4, *args, **kwargs):
         super().__init__()
-        c2 = c2 or c1
         
-        # Ensure reduction doesn't make groups too large
-        self.reduction = min(reduction, c1 // 4) if c1 >= 32 else 4
+        # We completely ignore c2. Attention mechanisms must preserve channel depth.
+        # Ensure intermediate channels don't drop below 1
+        redu_channels = max(1, c1 // rate)
         
-        self.channel_att = ChannelAttentionGAM(c1, self.reduction)
-        self.spatial_att = SpatialAttentionGAM(c1, self.reduction)
-        
-        # Optional: projection if input/output channels differ
-        self.proj = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
-        
-    def forward(self, x):
-        # Channel attention
-        x = self.channel_att(x)
-        
-        # Spatial attention
-        x = self.spatial_att(x)
-        
-        # Project if needed
-        x = self.proj(x)
-        
-        return x
-
-
-class GAMLite(nn.Module):
-    """
-    Lightweight GAM for nano/small models
-    Reduced kernel size and higher reduction ratio
-    """
-    def __init__(self, c1, c2=None, reduction=32):
-        super().__init__()
-        c2 = c2 or c1
-        self.reduction = min(reduction, c1 // 4) if c1 >= 32 else 4
-        
-        self.channel_att = ChannelAttentionGAM(c1, self.reduction)
-        
-        # Lighter spatial attention with smaller kernel
-        self.spatial_conv = nn.Sequential(
-            nn.Conv2d(c1, c1, 5, padding=2, groups=c1 // self.reduction),
-            nn.BatchNorm2d(c1),
-            nn.Sigmoid()
+        # Channel Attention Submodule
+        # Uses Linear layers on the permuted channel dimension
+        self.channel_attention = nn.Sequential(
+            nn.Linear(c1, redu_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(redu_channels, c1)
         )
         
-        self.proj = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
-        
-    def forward(self, x):
-        x = self.channel_att(x)
-        x = x * self.spatial_conv(x)
-        x = self.proj(x)
-        return x
-
-
-class GAM_v2(nn.Module):
-    """
-    GAM Version 2 - Optimized for inference speed
-    Uses depthwise separable convolutions
-    """
-    def __init__(self, c1, c2=None, reduction=16):
-        super().__init__()
-        c2 = c2 or c1
-        
-        # Channel attention (same as GAM)
-        mid_channels = c1 // reduction
-        self.channel_mlp = nn.Sequential(
-            nn.Linear(c1, mid_channels),
-            nn.GELU(),
-            nn.Linear(mid_channels, c1),
-            nn.Sigmoid()
+        # Spatial Attention Submodule
+        # Uses 7x7 convolutions to capture broad spatial context
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(c1, redu_channels, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm2d(redu_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(redu_channels, c1, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm2d(c1)
         )
-        
-        # Spatial attention (depthwise separable)
-        self.spatial_dw = nn.Conv2d(c1, c1, 7, padding=3, groups=c1)
-        self.spatial_pw = nn.Conv2d(c1, c1, 1)
-        self.spatial_bn = nn.BatchNorm2d(c1)
-        self.spatial_act = nn.Sigmoid()
-        
-        self.proj = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
-        
+
     def forward(self, x):
-        b, c, h, w = x.size()
+        # --- 1. Channel Attention ---
+        # Permute from (B, C, H, W) to (B, H, W, C) so Linear applies to Channels
+        x_permuted = x.permute(0, 2, 3, 1) 
+        c_att = self.channel_attention(x_permuted)
+        # Permute back to (B, C, H, W)
+        c_att = c_att.permute(0, 3, 1, 2)
         
-        # Channel attention
-        x_flat = x.view(b, c, -1).permute(0, 2, 1)
-        ch_att = self.channel_mlp(x_flat).permute(0, 2, 1).view(b, c, h, w)
-        x = x * ch_att
+        # Apply Channel Attention
+        x = x * torch.sigmoid(c_att)
         
-        # Spatial attention (depthwise separable)
-        sp_att = self.spatial_dw(x)
-        sp_att = self.spatial_pw(sp_att)
-        sp_att = self.spatial_act(self.spatial_bn(sp_att))
-        x = x * sp_att
+        # --- 2. Spatial Attention ---
+        s_att = self.spatial_attention(x)
         
-        return self.proj(x)
+        # Apply Spatial Attention
+        x = x * torch.sigmoid(s_att)
+        
+        return x
