@@ -2718,3 +2718,69 @@ class GAM(nn.Module):
         x = x * torch.sigmoid(s_att)
         
         return x
+import torch
+import torch.nn as nn
+
+class ZPool(nn.Module):
+    """
+    Z-Pool: Compresses the tensor along the 1st dimension by concatenating
+    Max Pooling and Average Pooling. Reduces any channel depth to 2 channels.
+    """
+    def forward(self, x):
+        return torch.cat((torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
+
+class AttentionGate(nn.Module):
+    """
+    Applies standard 7x7 convolution to the Z-Pooled 2-channel tensor
+    to generate attention weights.
+    """
+    def __init__(self):
+        super().__init__()
+        self.compress = ZPool()
+        # Takes 2 channels (from ZPool) and outputs 1 channel (attention map)
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, stride=1, padding=3, bias=False)
+        self.bn = nn.BatchNorm2d(1, eps=1e-5, momentum=0.01, affine=True)
+
+    def forward(self, x):
+        x_compress = self.compress(x)
+        y = self.conv(x_compress)
+        y = self.bn(y)
+        return torch.sigmoid(y)
+
+class TripletAttention(nn.Module):
+    """
+    Rotate to Attend: Convolutional Triplet Attention Module
+    Bulletproof implementation for Ultralytics YOLO YAML parser.
+    Paper: https://arxiv.org/abs/2010.00746
+    """
+    def __init__(self, c1, c2=None, *args, **kwargs):
+        super().__init__()
+        
+        # Completely ignores c1 and c2 because Triplet Attention applies operations 
+        # based on fixed Z-Pooling rather than channel-specific convolutions!
+        # *args and **kwargs absorb any YAML scaling/parser artifacts.
+        
+        self.cw = AttentionGate() # Channel-Width branch
+        self.hc = AttentionGate() # Height-Channel branch
+        self.hw = AttentionGate() # Height-Width (Spatial) branch
+
+    def forward(self, x):
+        # --- Branch 1: Height-Width (Spatial) ---
+        x_out1 = self.hw(x) * x
+
+        # --- Branch 2: Channel-Width (Cross-dimension) ---
+        # Rotate (B, C, H, W) -> (B, H, C, W)
+        x_perm1 = x.permute(0, 2, 1, 3).contiguous()
+        x_out2 = self.cw(x_perm1) * x_perm1
+        # Rotate back to (B, C, H, W)
+        x_out2 = x_out2.permute(0, 2, 1, 3).contiguous()
+
+        # --- Branch 3: Channel-Height (Cross-dimension) ---
+        # Rotate (B, C, H, W) -> (B, W, H, C)
+        x_perm2 = x.permute(0, 3, 2, 1).contiguous()
+        x_out3 = self.hc(x_perm2) * x_perm2
+        # Rotate back to (B, C, H, W)
+        x_out3 = x_out3.permute(0, 3, 2, 1).contiguous()
+
+        # Average the three branches
+        return (x_out1 + x_out2 + x_out3) / 3
