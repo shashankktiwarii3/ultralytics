@@ -2166,3 +2166,96 @@ class SGDG_VisDrone(nn.Module):
         
         # 3. Inject
         return f_deep + self.gamma * self.phi(g * hf)
+    
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FASA(nn.Module):
+    """
+    FASA — Feature-Adaptive Statistical Attention.
+
+    Statistics-driven attention. Channel attention is an ECA-style 1-D
+    interaction over a learned convex mix of {mean, std, CV}; spatial
+    attention is a multi-scale, directionally-factorized map over a
+    {mean, max, var} channel-pooled descriptor; the two are combined by a
+    per-channel gate predicted from global feature statistics.
+
+    Novel term: CV = σ / (|μ| + σ + ε) ∈ [0, 1)  — a bounded, scale-invariant
+    dispersion descriptor for the large object-scale variation of aerial data.
+
+    Numerical guards (eps, fp32 stats, dtype casts) are implementation details,
+    not part of the formulation.
+    """
+
+    def __init__(self, c1, c2=None, *args, **kwargs):
+        super().__init__()
+        C = c1
+        k = int(abs((math.log2(C) / 2) + 0.5))
+        k = k if k % 2 else k + 1
+        self.eps = 1e-6
+
+        # channel: convex mix of 3 stats -> ECA 1-D conv
+        self.moment_logits = nn.Parameter(torch.zeros(3))
+        self.channel_conv  = nn.Conv1d(1, 1, k, padding=k // 2, bias=False)
+
+        # spatial: {mean,max,var} -> 1ch, then 3 directional scales (3,5,7)
+        self.pool_fuse = nn.Conv2d(3, 1, 1, bias=False)
+        self.ca_h = nn.ModuleList(
+            [nn.Conv2d(1, 1, (kk, 1), padding=(kk // 2, 0), bias=False) for kk in (3, 5, 7)]
+        )
+        self.ca_w = nn.ModuleList(
+            [nn.Conv2d(1, 1, (1, kk), padding=(0, kk // 2), bias=False) for kk in (3, 5, 7)]
+        )
+        self.scale_logits = nn.Parameter(torch.zeros(3))
+
+        # per-channel fusion gate from 2 global statistics
+        self.gate = nn.Sequential(nn.Linear(2, 16), nn.ReLU(inplace=True), nn.Linear(16, C))
+
+        self.alpha = nn.Parameter(torch.tensor(0.15))
+
+    def forward(self, x):
+        dt = x.dtype
+        B, C, H, W = x.shape
+        xf = x.float()  # stats in fp32
+
+        # ---- channel ----
+        mu_c  = xf.mean(dim=(2, 3))                                   # (B,C)
+        var_c = xf.var(dim=(2, 3), correction=0)                     # (B,C)
+        sd_c  = (var_c + self.eps).sqrt()
+        cv_c  = sd_c / (mu_c.abs() + sd_c + self.eps)                # (B,C), in [0,1)
+
+        w   = F.softmax(self.moment_logits, dim=0)
+        d_c = (w[0] * mu_c + w[1] * sd_c + w[2] * cv_c).to(dt)       # (B,C)
+        a_c = torch.sigmoid(
+            self.channel_conv(d_c.unsqueeze(1)).squeeze(1)
+        ).view(B, C, 1, 1)
+
+        # ---- spatial ----
+        sp_mean = xf.mean(dim=1, keepdim=True)
+        sp_max  = xf.amax(dim=1, keepdim=True)
+        sp_var  = xf.var(dim=1, keepdim=True, correction=0) + self.eps
+        p = self.pool_fuse(torch.cat([sp_mean, sp_max, sp_var], dim=1).to(dt))
+
+        sw  = F.softmax(self.scale_logits, dim=0)
+        a_s = sum(
+            sw[i] * (torch.sigmoid(self.ca_h[i](p)) * torch.sigmoid(self.ca_w[i](p)))
+            for i in range(3)
+        )                                                            # (B,1,H,W)
+
+        # ---- gate ----
+        sp_disp    = sp_var.mean(dim=(2, 3))                         # (B,1)
+        ch_disp    = var_c.mean(dim=1, keepdim=True)                 # (B,1)
+        disp_ratio = torch.log1p(sp_disp / (ch_disp + self.eps))
+        sp_var_n   = sp_var / (sp_var.mean(dim=(2, 3), keepdim=True) + self.eps)
+        peak       = sp_var_n.amax(dim=(2, 3))                       # (B,1)
+        g = torch.sigmoid(
+            self.gate(torch.cat([disp_ratio, peak], dim=1).to(dt))
+        ).view(B, C, 1, 1)
+
+        # ---- fuse + bounded residual ----
+        a     = a_c * (g * a_s + (1 - g))
+        alpha = self.alpha.to(dt)
+        return x * (1 + alpha * (2 * a - 1))
