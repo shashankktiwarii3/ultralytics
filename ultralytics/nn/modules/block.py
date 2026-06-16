@@ -2108,3 +2108,61 @@ class FPDG(nn.Module):
         hf = f_shallow - self.blur(f_shallow)              # high-frequency residual
         g = self.gate(torch.cat((hf, hf.abs()), dim=1))    # local detail gate (0,1)
         return f_deep + self.gamma * self.phi(g * hf)      # identity when gamma=0
+    
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SGDG_VisDrone(nn.Module):
+    """Context-Aware Dilated Detail Gate for Extreme Tiny Objects (VisDrone)."""
+    def __init__(self, c_shallow, c_deep):
+        super().__init__()
+        
+        # 1. Cross-Channel Semantic Fusion
+        self.cross_mix = nn.Sequential(
+            nn.Conv2d(c_shallow + c_deep, c_shallow, 1, bias=False),
+            nn.BatchNorm2d(c_shallow),
+            nn.SiLU() # Better gradient flow than ReLU for YOLO
+        )
+        
+        # 2. Multi-Scale Spatial Gate (Standard + Dilated)
+        # Dilated conv expands the receptive field so the gate can 'see' surrounding 
+        # context to determine if an HF spike is a tiny object or just background noise.
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(c_shallow, c_shallow, 3, 1, 1, groups=c_shallow),
+            nn.SiLU(),
+            nn.Conv2d(c_shallow, c_shallow, 3, 1, 2, groups=c_shallow, dilation=2), 
+            nn.Sigmoid()
+        )
+        
+        # Parameter-free HF extraction (k=3 preserves 2x2 pixel objects!)
+        self.pool_k = 3
+        
+        # Channel-mix HF -> Deep
+        self.phi = nn.Sequential(
+            nn.Conv2d(c_shallow, c_deep, 1, bias=False),
+            nn.BatchNorm2d(c_deep)
+        )
+        
+        # Zero-init residual (exact identity at start)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        f_shallow, f_deep = x[0], x[1]
+        
+        # Auto-fix spatial mismatch (Crucial for high-res VisDrone images)
+        if f_shallow.shape[-2:] != f_deep.shape[-2:]:
+            f_deep = F.interpolate(f_deep, size=f_shallow.shape[-2:], mode='bilinear', align_corners=False)
+        
+        # 1. HF Extraction
+        f_low = F.avg_pool2d(f_shallow, kernel_size=self.pool_k, stride=1, padding=self.pool_k//2)
+        hf = f_shallow - f_low
+        
+        # 2. Semantic Gating
+        g_input = torch.cat([hf, f_deep], dim=1)
+        g_mix = self.cross_mix(g_input)
+        g = self.spatial_gate(g_mix) # Gating mask [0, 1]
+        
+        # 3. Inject
+        return f_deep + self.gamma * self.phi(g * hf)
