@@ -2071,3 +2071,40 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+import torch
+import torch.nn as nn
+
+class FPDG(nn.Module):
+    """Frequency-Preserving Detail Gate.
+
+    Re-injects high-frequency detail from a shallow (high-res) feature into a
+    deeper (upsampled) feature at the SAME spatial resolution. Additive residual
+    with a zero-initialized scalar -> exact identity at init (safe from scratch).
+
+    YAML 'from' MUST be [shallow_idx, deep_idx]:
+        x[0] = shallow feature  (backbone P2, the detail source)
+        x[1] = deep feature     (upsampled neck feature, same H,W as x[0])
+    Output channels = c_deep.
+    """
+    def __init__(self, c_shallow, c_deep=None, blur_k=3):
+        super().__init__()
+        c_deep = c_deep or c_shallow
+        # learnable low-pass, initialized as an averaging blur
+        self.blur = nn.Conv2d(c_shallow, c_shallow, blur_k, 1, blur_k // 2,
+                              groups=c_shallow, bias=False)
+        # detail-energy gate from [hf, |hf|], depthwise (cheap, native resolution)
+        self.gate = nn.Sequential(
+            nn.Conv2d(2 * c_shallow, c_shallow, 3, 1, 1, groups=c_shallow),
+            nn.Sigmoid())
+        self.phi = nn.Conv2d(c_shallow, c_deep, 1)     # channel-mix high-freq -> c_deep
+        self.gamma = nn.Parameter(torch.zeros(1))      # zero-init residual
+        nn.init.constant_(self.blur.weight, 1.0 / (blur_k * blur_k))
+
+    def forward(self, x):
+        f_shallow, f_deep = x[0], x[1]
+        assert f_shallow.shape[-2:] == f_deep.shape[-2:], \
+            f"FPDG spatial mismatch: {f_shallow.shape} vs {f_deep.shape}"
+        hf = f_shallow - self.blur(f_shallow)              # high-frequency residual
+        g = self.gate(torch.cat((hf, hf.abs()), dim=1))    # local detail gate (0,1)
+        return f_deep + self.gamma * self.phi(g * hf)      # identity when gamma=0
