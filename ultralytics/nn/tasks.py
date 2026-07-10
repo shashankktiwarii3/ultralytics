@@ -1617,7 +1617,7 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
-            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, SAKA, SE, ECA, CBAM, CoordAtt, HighFreqInject, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention, HFRA
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, SAKA, SE, ECA, CBAM, CoordAtt, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention, HFRA
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1637,7 +1637,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
-            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, WGCA, SAKA, SE, ECA, CBAM, CoordAtt, HighFreqInject, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
+            FASA, MuTOA, C2TSMA, C2PSA, C2MSDPRA, WGCA, SAKA, SE, ECA, CBAM, CoordAtt, MSCA, SimAM, EMA, LCSA, LCSAv2,CSCA, RepLKA, LKA_HFGate,HRGA,HFLKA, LKA,  WCA, MDC, CoordinationAttention,HFRA
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
