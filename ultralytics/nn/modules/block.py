@@ -2065,3 +2065,1347 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# class FASA(nn.Module):
+#     """
+#     FASA — Feature-Adaptive Statistical Attention.
+
+#     Statistics-driven attention. Channel attention is an ECA-style 1-D
+#     interaction over a learned convex mix of {mean, std, CV}; spatial
+#     attention is a multi-scale, directionally-factorized map over a
+#     {mean, max, var} channel-pooled descriptor; the two are combined by a
+#     per-channel gate predicted from global feature statistics.
+
+#     Novel term: CV = σ / (|μ| + σ + ε) ∈ [0, 1)  — a bounded, scale-invariant
+#     dispersion descriptor for the large object-scale variation of aerial data.
+
+#     Numerical guards (eps, fp32 stats, dtype casts) are implementation details,
+#     not part of the formulation.
+#     """
+
+#     def __init__(self, c1, c2=None, *args, **kwargs):
+#         super().__init__()
+#         C = c1
+#         k = int(abs((math.log2(C) / 2) + 0.5))
+#         k = k if k % 2 else k + 1
+#         self.eps = 1e-6
+
+#         # channel: convex mix of 3 stats -> ECA 1-D conv
+#         self.moment_logits = nn.Parameter(torch.zeros(3))
+#         self.channel_conv  = nn.Conv1d(1, 1, k, padding=k // 2, bias=False)
+
+#         # spatial: {mean,max,var} -> 1ch, then 3 directional scales (3,5,7)
+#         self.pool_fuse = nn.Conv2d(3, 1, 1, bias=False)
+#         self.ca_h = nn.ModuleList(
+#             [nn.Conv2d(1, 1, (kk, 1), padding=(kk // 2, 0), bias=False) for kk in (3, 5, 7)]
+#         )
+#         self.ca_w = nn.ModuleList(
+#             [nn.Conv2d(1, 1, (1, kk), padding=(0, kk // 2), bias=False) for kk in (3, 5, 7)]
+#         )
+#         self.scale_logits = nn.Parameter(torch.zeros(3))
+
+#         # per-channel fusion gate from 2 global statistics
+#         self.gate = nn.Sequential(nn.Linear(2, 16), nn.ReLU(inplace=True), nn.Linear(16, C))
+
+#         self.alpha = nn.Parameter(torch.tensor(0.15))
+
+#     def forward(self, x):
+#         dt = x.dtype
+#         B, C, H, W = x.shape
+#         xf = x.float()  # stats in fp32
+
+#         # ---- channel ----
+#         mu_c  = xf.mean(dim=(2, 3))                                   # (B,C)
+#         var_c = xf.var(dim=(2, 3), correction=0)                     # (B,C)
+#         sd_c  = (var_c + self.eps).sqrt()
+#         cv_c  = sd_c / (mu_c.abs() + sd_c + self.eps)                # (B,C), in [0,1)
+
+#         w   = F.softmax(self.moment_logits, dim=0)
+#         d_c = (w[0] * mu_c + w[1] * sd_c + w[2] * cv_c).to(dt)       # (B,C)
+#         a_c = torch.sigmoid(
+#             self.channel_conv(d_c.unsqueeze(1)).squeeze(1)
+#         ).view(B, C, 1, 1)
+
+#         # ---- spatial ----
+#         sp_mean = xf.mean(dim=1, keepdim=True)
+#         sp_max  = xf.amax(dim=1, keepdim=True)
+#         sp_var  = xf.var(dim=1, keepdim=True, correction=0) + self.eps
+#         p = self.pool_fuse(torch.cat([sp_mean, sp_max, sp_var], dim=1).to(dt))
+
+#         sw  = F.softmax(self.scale_logits, dim=0)
+#         a_s = sum(
+#             sw[i] * (torch.sigmoid(self.ca_h[i](p)) * torch.sigmoid(self.ca_w[i](p)))
+#             for i in range(3)
+#         )                                                            # (B,1,H,W)
+
+#         # ---- gate ----
+#         sp_disp    = sp_var.mean(dim=(2, 3))                         # (B,1)
+#         ch_disp    = var_c.mean(dim=1, keepdim=True)                 # (B,1)
+#         disp_ratio = torch.log1p(sp_disp / (ch_disp + self.eps))
+#         sp_var_n   = sp_var / (sp_var.mean(dim=(2, 3), keepdim=True) + self.eps)
+#         peak       = sp_var_n.amax(dim=(2, 3))                       # (B,1)
+#         g = torch.sigmoid(
+#             self.gate(torch.cat([disp_ratio, peak], dim=1).to(dt))
+#         ).view(B, C, 1, 1)
+
+#         # ---- fuse + bounded residual ----
+#         a     = a_c * (g * a_s + (1 - g))
+#         alpha = self.alpha.to(dt)
+#         return x * (1 + alpha * (2 * a - 1))
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FASA(nn.Module):
+    r"""FASA — Feature-Adaptive Statistical Attention.
+
+    A lightweight, statistics-driven attention block intended for tiny-object
+    detection (TOD), where features carry large object-scale variation.
+
+    Three cooperating paths:
+      * Channel  : ECA-style 1-D interaction over a convex mix of standardized
+                   channel statistics {mean, std, CV}.
+      * Spatial  : multi-scale, directionally-factorized map over a {mean,max,var}
+                   channel-pooled descriptor.
+      * Gate     : per-channel blend of the two, predicted from two global
+                   dispersion statistics.
+
+    Novelty term:
+        CV = σ / (|μ| + σ + ε) ∈ [0, 1)
+      a bounded, scale-invariant dispersion descriptor. Because the raw moments
+      live on incomparable scales, all three are z-scored across the channel axis
+      *before* the convex mix, so the learned softmax weights — not raw magnitude —
+      decide each term's contribution. This is what makes the CV ablation honest.
+
+    Identity at init:
+        out = x * (1 + alpha * (2a - 1)),   alpha initialized to 0
+      The block is the exact identity at step 0 (ReZero/LayerScale style) and
+      learns its modulation strength and sign from zero, so it can be dropped into
+      a pretrained backbone without perturbing it.
+
+    Args:
+        c1 (int): input channels.
+        c2 (int, optional): unused; present for Ultralytics yaml compatibility.
+        use_cv (bool): include the CV term in the channel mix. Set False for the
+            "minus-CV" ablation row.
+    """
+
+    def __init__(self, c1: int, c2: int = None, *args, use_cv: bool = True, **kwargs) -> None:
+        super().__init__()
+        C = c1
+        self.eps = 1e-6
+        self.use_cv = use_cv
+        self.n_moments = 3 if use_cv else 2
+
+        # --- channel: convex mix of standardized stats -> ECA 1-D conv ---
+        k = int(abs((math.log2(C) / 2) + 0.5))
+        k = k if k % 2 else k + 1
+        self.moment_logits = nn.Parameter(torch.zeros(self.n_moments))
+        self.channel_conv = nn.Conv1d(1, 1, k, padding=k // 2, bias=False)
+
+        # --- spatial: {mean,max,var} -> 1ch, then 3 directional scales ---
+        self.pool_fuse = nn.Conv2d(3, 1, 1, bias=False)
+        self.ca_h = nn.ModuleList(
+            [nn.Conv2d(1, 1, (kk, 1), padding=(kk // 2, 0), bias=False) for kk in (3, 5, 7)]
+        )
+        self.ca_w = nn.ModuleList(
+            [nn.Conv2d(1, 1, (1, kk), padding=(0, kk // 2), bias=False) for kk in (3, 5, 7)]
+        )
+        self.scale_logits = nn.Parameter(torch.zeros(3))
+
+        # --- per-channel fusion gate from 2 global dispersion statistics ---
+        self.gate = nn.Sequential(
+            nn.Linear(2, 16), nn.ReLU(inplace=True), nn.Linear(16, C)
+        )
+
+        # --- bounded residual scale; 0 -> exact identity at init ---
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    @staticmethod
+    def _zscore(t: torch.Tensor, dim: int, eps: float) -> torch.Tensor:
+        """Standardize across `dim` so heterogeneous statistics become comparable."""
+        m = t.mean(dim=dim, keepdim=True)
+        s = t.std(dim=dim, keepdim=True)
+        return (t - m) / (s + eps)
+
+    def _channel_attention(self, xf: torch.Tensor, dt: torch.dtype):
+        """ECA over a standardized convex mix of channel statistics."""
+        B, C = xf.shape[:2]
+        mu_c = xf.mean(dim=(2, 3))                              # (B,C)
+        var_c = xf.var(dim=(2, 3), correction=0)               # (B,C)
+        sd_c = (var_c + self.eps).sqrt()
+
+        moments = [self._zscore(mu_c, 1, self.eps),
+                   self._zscore(sd_c, 1, self.eps)]
+        if self.use_cv:
+            cv_c = sd_c / (mu_c.abs() + sd_c + self.eps)        # (B,C) in [0,1)
+            moments.append(self._zscore(cv_c, 1, self.eps))
+
+        w = F.softmax(self.moment_logits, dim=0)
+        d_c = sum(w[i] * moments[i] for i in range(self.n_moments)).to(dt)  # (B,C)
+        a_c = torch.sigmoid(
+            self.channel_conv(d_c.unsqueeze(1)).squeeze(1)
+        ).view(B, C, 1, 1)
+        return a_c, var_c
+
+    def _spatial_attention(self, xf: torch.Tensor, dt: torch.dtype):
+        """Multi-scale directionally-factorized spatial map."""
+        sp_mean = xf.mean(dim=1, keepdim=True)
+        sp_max = xf.amax(dim=1, keepdim=True)
+        sp_var = xf.var(dim=1, keepdim=True, correction=0) + self.eps
+        p = self.pool_fuse(torch.cat([sp_mean, sp_max, sp_var], dim=1).to(dt))
+
+        sw = F.softmax(self.scale_logits, dim=0)
+        a_s = sum(
+            sw[i] * (torch.sigmoid(self.ca_h[i](p)) * torch.sigmoid(self.ca_w[i](p)))
+            for i in range(3)
+        )                                                       # (B,1,H,W)
+        return a_s, sp_var
+
+    def _fusion_gate(self, var_c: torch.Tensor, sp_var: torch.Tensor, dt: torch.dtype):
+        """Per-channel blend weight from two global dispersion statistics."""
+        B, C = var_c.shape
+        sp_disp = sp_var.mean(dim=(2, 3))                       # (B,1)
+        ch_disp = var_c.mean(dim=1, keepdim=True)               # (B,1)
+        disp_ratio = torch.log1p(sp_disp / (ch_disp + self.eps))
+        sp_var_n = sp_var / (sp_var.mean(dim=(2, 3), keepdim=True) + self.eps)
+        peak = sp_var_n.amax(dim=(2, 3))                        # (B,1)
+        g = torch.sigmoid(
+            self.gate(torch.cat([disp_ratio, peak], dim=1).to(dt))
+        ).view(B, C, 1, 1)
+        return g
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dt = x.dtype
+        xf = x.float()  # all statistics computed in fp32 for numerical stability
+
+        a_c, var_c = self._channel_attention(xf, dt)
+        a_s, sp_var = self._spatial_attention(xf, dt)
+        g = self._fusion_gate(var_c, sp_var, dt)
+
+        # fuse: g blends spatial map with a unit (pass-through) prior, per channel
+        a = a_c * (g * a_s + (1.0 - g))                         # (B,C,H,W), in (0,1)
+
+        # bounded, identity-at-init residual
+        alpha = self.alpha.to(dt)
+        return x * (1.0 + alpha * (2.0 * a - 1.0))
+
+class CoordinationAttention(nn.Module):
+    def __init__(self, c1, c2, reduction=32):
+        super().__init__()
+        assert c1 == c2, f"CoordinationAttention requires c1==c2, got {c1} vs {c2}"
+
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, c1 // reduction)
+
+        self.conv1 = nn.Conv2d(c1, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.SiLU()
+
+        self.conv_h = nn.Conv2d(mip, c1, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, c1, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+        b, c, h, w = x.size()
+
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.act(self.bn1(self.conv1(y)))
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        return identity * a_h * a_w
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ----------------------------------------------------------------------
+# Orthonormal Haar DWT / IDWT as fixed grouped convs.
+# Orthonormal => synthesis is the exact transpose of analysis, so the
+# DWT->IDWT round trip is lossless (reconstruction is exact). Implemented
+# as conv2d / conv_transpose2d (stride 2) so it stays ONNX/TensorRT
+# exportable -- important for YOLO26's edge story. Swap in
+# `pytorch_wavelets` (DWTForward/DWTInverse) if you prefer a vetted lib.
+# ----------------------------------------------------------------------
+def _haar2d():
+    s = 0.5  # (1/sqrt2)^2, orthonormal separable Haar
+    ll = torch.tensor([[ s,  s], [ s,  s]])
+    lh = torch.tensor([[ s,  s], [-s, -s]])
+    hl = torch.tensor([[ s, -s], [ s, -s]])
+    hh = torch.tensor([[ s, -s], [-s,  s]])
+    return torch.stack([ll, lh, hl, hh], 0)  # (4, 2, 2)
+
+
+class HaarDWT(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        w = _haar2d().unsqueeze(1).repeat(ch, 1, 1, 1)  # (4*ch, 1, 2, 2)
+        self.register_buffer("w", w)
+        self.ch = ch
+
+    def forward(self, x):
+        y = F.conv2d(x, self.w.to(x.dtype), stride=2, groups=self.ch)
+        B, _, H, W = y.shape
+        y = y.view(B, self.ch, 4, H, W)
+        return y[:, :, 0], y[:, :, 1], y[:, :, 2], y[:, :, 3]  # LL, LH, HL, HH
+
+
+class HaarIDWT(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        w = _haar2d().unsqueeze(1).repeat(ch, 1, 1, 1)  # (4*ch, 1, 2, 2)
+        self.register_buffer("w", w)
+        self.ch = ch
+
+    def forward(self, ll, lh, hl, hh):
+        B, C, H, W = ll.shape
+        y = torch.stack([ll, lh, hl, hh], 2).view(B, C * 4, H, W)
+        return F.conv_transpose2d(y, self.w.to(y.dtype), stride=2, groups=self.ch)
+
+class LKA(nn.Module):
+    """Decomposed large-kernel attention. Channel-preserving."""
+    def __init__(self, c1, c2=None, k=5, dk=7, d=3):
+        super().__init__()
+        ch = c1
+        self.dw = nn.Conv2d(ch, ch, k, padding=k // 2, groups=ch)
+        self.dwd = nn.Conv2d(ch, ch, dk, padding=(dk // 2) * d, groups=ch, dilation=d)
+        self.pw = nn.Conv2d(ch, ch, 1)
+
+    def forward(self, x):
+        return x * self.pw(self.dwd(self.dw(x)))
+
+
+class WGCA(nn.Module):
+    """Wavelet-Gated Context Attention. Channel-preserving.
+    YAML args after the channel drive ablations:
+      [c]               -> context=True,  gate=True
+      [c, False, False] -> lossless wavelet only
+      [c, True, False]  -> context, no gating
+    """
+    def __init__(self, c1, c2=None, context=True, gate=True):
+        super().__init__()
+        ch = c1
+        self.use_gate = gate
+        self.dwt = HaarDWT(ch)
+        self.idwt = HaarIDWT(ch)
+        self.ctx = LKA(ch) if context else nn.Identity()
+        self.gate_conv = nn.Conv2d(ch, 3 * ch, 1) if gate else None
+        self.proj = nn.Conv2d(ch, ch, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        ll, lh, hl, hh = self.dwt(x)
+        ctx = self.ctx(ll)
+        if self.use_gate:
+            gl, gh, ghh = torch.sigmoid(self.gate_conv(ctx)).chunk(3, 1)
+            lh, hl, hh = lh * gl, hl * gh, hh * ghh
+        return x + self.gamma * self.proj(self.idwt(ctx, lh, hl, hh))
+    
+class WCA(nn.Module):
+    """Wavelet Context Attention (gate-free). Lossless Haar split -> LKA context
+    on the half-res LL band -> exact IDWT -> LayerScale residual. Detail subbands
+    pass through unmodulated (gating ablated out after gate-inertness analysis)."""
+    def __init__(self, c1, c2=None):
+        super().__init__()
+        ch = c1
+        self.dwt = HaarDWT(ch)
+        self.idwt = HaarIDWT(ch)
+        self.ctx = LKA(ch)
+        self.proj = nn.Conv2d(ch, ch, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        ll, lh, hl, hh = self.dwt(x)
+        ctx = self.ctx(ll)
+        return x + self.gamma * self.proj(self.idwt(ctx, lh, hl, hh))
+
+
+class ECA(nn.Module):
+    """Efficient channel attention (no FC, ~0 params)."""
+    def __init__(self, ch, k=3):
+        super().__init__()
+        self.conv = nn.Conv1d(1, 1, k, padding=k // 2, bias=False)
+
+    def forward(self, x):
+        y = x.mean((2, 3), keepdim=True)                       # B,C,1,1
+        y = self.conv(y.squeeze(-1).transpose(1, 2)).transpose(1, 2).unsqueeze(-1)
+        return x * torch.sigmoid(y)
+
+
+class MDC(nn.Module):
+    """Multi-scale Dilated Context — receptive-field expansion at P4.
+    Parallel depthwise dilated branches aggregate multi-scale context; ECA
+    reweights channels; LayerScale residual (gamma init 0, matches WCA / stable
+    on the end2end one-to-one head). Channel-preserving."""
+    def __init__(self, c1, c2=None, dilations=(1, 3, 5), k=3):
+        super().__init__()
+        ch = c1
+        self.branches = nn.ModuleList(
+            nn.Conv2d(ch, ch, k, padding=(k // 2) * d, dilation=d, groups=ch)
+            for d in dilations
+        )
+        self.fuse = nn.Conv2d(ch * len(dilations), ch, 1)
+        self.eca = ECA(ch)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        y = torch.cat([b(x) for b in self.branches], 1)
+        y = self.eca(self.fuse(y))
+        return x + self.gamma * y
+
+class SAKA(nn.Module):
+    """Scale-Adaptive Kernel Attention. LKA uses one fixed dilated depthwise
+    conv for its large receptive field; SAKA replaces it with several dilated
+    branches whose per-location mixing weights are predicted from local content,
+    so the effective receptive field adapts to object scale (targets VisDrone's
+    extreme scale variance). Output form matches LKA (x * attn) for a clean swap.
+      adaptive=True  -> content-routed branch weights (full module)
+      adaptive=False -> fixed equal weights (multi-dilation control)
+    """
+    def __init__(self, c1, c2=None, adaptive=False, k=5, dilations=(1, 3, 5)):
+        super().__init__()
+        ch = c1
+        self.adaptive = adaptive
+        self.n = len(dilations)
+        self.local = nn.Conv2d(ch, ch, k, padding=k // 2, groups=ch)
+        self.branches = nn.ModuleList(
+            nn.Conv2d(ch, ch, k, padding=(k // 2) * d, dilation=d, groups=ch)
+            for d in dilations
+        )
+        self.router = nn.Conv2d(ch, self.n, 1) if adaptive else None
+        self.pw = nn.Conv2d(ch, ch, 1)
+
+    def forward(self, x):
+        loc = self.local(x)
+        outs = [b(loc) for b in self.branches]              # n x (B,C,H,W)
+        if self.adaptive:
+            w = torch.softmax(self.router(loc), dim=1)      # (B,n,H,W)
+            ctx = sum(outs[i] * w[:, i:i + 1] for i in range(self.n))
+        else:
+            ctx = sum(outs) / self.n
+        return x * self.pw(ctx)
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class HFLKA(nn.Module):
+    """High-Frequency Large Kernel Attention.
+    Designed specifically for Tiny Object Detection (VisDrone).
+    1. Dense Asymmetric Convolutions: Fixes the 'grid artifact' of dilated convs.
+    2. High-Frequency Gate: Suppresses massive background noise.
+    """
+    def __init__(self, c1, c2, k=7):
+        super().__init__()
+        self.ch = c1
+        
+        # 1. Local dense feature extraction (matches LKA's first stage)
+        self.local = nn.Conv2d(self.ch, self.ch, 5, padding=2, groups=self.ch)
+        
+        # 2. Dense Asymmetric Large Kernel (Cross-shaped, no holes)
+        self.dw_h = nn.Conv2d(self.ch, self.ch, (1, k), padding=(0, k // 2), groups=self.ch)
+        self.dw_v = nn.Conv2d(self.ch, self.ch, (k, 1), padding=(k // 2, 0), groups=self.ch)
+        
+        # 3. High-Frequency Gate (Parameter-free Laplacian)
+        # Extracts edges/specks (tiny objects) and suppresses flat backgrounds
+        hp = torch.tensor([[[[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]]]], dtype=torch.float32)
+        self.register_buffer('hp', hp.repeat(self.ch, 1, 1, 1))
+        
+        # 4. Projection
+        self.pw = nn.Conv2d(self.ch, self.ch, 1)
+
+    def forward(self, x):
+        # Extract high-frequency mask 
+        # (Tiny objects = high response, Background = low response)
+        hf = F.conv2d(x, self.hp.to(x.dtype), padding=1, groups=self.ch)
+        
+        # Soft attention mask
+        gate = torch.sigmoid(torch.abs(hf)) 
+        
+        # Dense cross-shaped large kernel context
+        ctx = self.dw_v(self.dw_h(self.local(x)))
+        
+        # Gate the context: suppress background, amplify tiny objects
+        ctx = ctx * gate
+        
+        # Output matches LKA format (x * attn) for a clean swap
+        return x * self.pw(ctx)
+
+class HRGA(nn.Module):
+    """High-Resolution Gated Attention. Inputs [F3 (stride 8, main),
+    H2 (stride 4, detail source)]. F3 generates a semantic gate (WHERE objects
+    are); H2 carries the DETAIL; gate selects relevant detail; pixel-unshuffle
+    brings it losslessly to stride 8; LayerScale residual into F3.
+      gate=True  -> semantic gating (full module)
+      gate=False -> naive injection (control: is the gate doing anything?)
+    """
+    def __init__(self, c1, c2, gate=True):
+        super().__init__()                 # c1 = F3 ch (output), c2 = H2 ch (source)
+        self.gate = gate
+        self.proj = nn.Conv2d(c2, c1, 1)
+        self.gate_conv = nn.Conv2d(c1, 1, 1) if gate else None
+        self.fuse = nn.Conv2d(c1 * 4, c1, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        f3, h2 = x                                       # (B,C,H,W), (B,c2,2H,2W)
+        d = self.proj(h2)                                # (B,C,2H,2W)
+        if self.gate:
+            g = torch.sigmoid(self.gate_conv(f3))        # (B,1,H,W)
+            g = F.interpolate(g, scale_factor=2, mode="nearest")
+            d = d * g                                    # keep detail near objects
+        d = F.pixel_unshuffle(d, 2)                      # (B,4C,H,W) lossless
+        return f3 + self.gamma * self.fuse(d)            # (B,C,H,W)
+
+class LKA_HFGate(nn.Module):
+    def __init__(self, c1, c2=None, k=5, dk=7, d=3):
+        super().__init__(); ch = c1
+        self.dw  = nn.Conv2d(ch, ch, k, padding=k//2, groups=ch)
+        self.dwd = nn.Conv2d(ch, ch, dk, padding=(dk//2)*d, groups=ch, dilation=d)
+        self.pw  = nn.Conv2d(ch, ch, 1)
+        hp = torch.tensor([[[[-1,-1,-1],[-1,8,-1],[-1,-1,-1]]]], dtype=torch.float32)
+        self.register_buffer("hp", hp.repeat(ch, 1, 1, 1))
+    def forward(self, x):
+        gate = torch.sigmoid(torch.abs(F.conv2d(x, self.hp.to(x.dtype), padding=1, groups=x.shape[1])))
+        ctx = self.pw(self.dwd(self.dw(x)) * gate)   # LKA context, HF-gated
+        return x * ctx
+
+import torch
+import torch.nn as nn
+
+class RepLKA(nn.Module):
+    """
+    Train-time multi-branch Large Kernel Attention (LKA).
+    Merges to plain LKA (k=5 DW + 7x7 d=3 DW + 1x1) at inference.
+    """
+    def __init__(self, c1, c2, k=5, dk=7, d=3, deploy=False):
+        super().__init__()
+        
+        # In attention blocks, input channels (c1) usually equal output channels (c2).
+        # We use c2 for all convolutions to ensure consistency.
+        self.ch, self.k, self.dk, self.d, self.deploy = c2, k, dk, d, deploy
+        
+        if deploy:
+            # Inference-mode: Single unified convolution branches
+            self.dw  = nn.Conv2d(c2, c2, k,  padding=k//2, groups=c2)
+            self.dwd = nn.Conv2d(c2, c2, dk, padding=(dk//2)*d, groups=c2, dilation=d)
+        else:
+            # Training-mode: Multi-branch
+            # Stage 1 (dense, d=1): 5x5 + 3x3 parallel depthwise
+            self.dw_k = nn.Conv2d(c2, c2, k, padding=k//2, groups=c2)
+            self.dw_s = nn.Conv2d(c2, c2, 3, padding=1,   groups=c2)
+            
+            # Stage 2 (dilated, d=3): 7x7 + 5x5, BOTH at dilation d
+            self.dwd_k = nn.Conv2d(c2, c2, dk, padding=(dk//2)*d, groups=c2, dilation=d)
+            self.dwd_s = nn.Conv2d(c2, c2, 5,  padding=(5//2)*d,  groups=c2, dilation=d)
+            
+        # Pointwise convolution (1x1)
+        self.pw = nn.Conv2d(c2, c2, 1)
+
+    def _stage1(self, x): 
+        return self.dw(x) if self.deploy else self.dw_k(x) + self.dw_s(x)
+        
+    def _stage2(self, x): 
+        return self.dwd(x) if self.deploy else self.dwd_k(x) + self.dwd_s(x)
+
+    def forward(self, x):
+        # Attention scaling: x * Pointwise(Dilated_DW(Dense_DW(x)))
+        return x * self.pw(self._stage2(self._stage1(x)))
+    
+import torch
+import torch.nn as nn
+
+class CSCA(nn.Module):
+    """
+    Center-Surround Contrastive Attention (CSCA).
+    Resolves the Activation Spread paradox in YOLO26's NMS-Free One-to-One head.
+    Pins activations to the exact center of tiny objects (VisDrone) and inhibits edges/background.
+    """
+    def __init__(self, c1, c2=None, k_center=3, k_surround=7):
+        super().__init__()
+        ch = c1
+        
+        # 1. Center Branch (Excitatory): Captures the exact core of tiny objects
+        self.center = nn.Conv2d(ch, ch, k_center, padding=k_center // 2, groups=ch)
+        
+        # 2. Surround Branch (Inhibitory): Captures local background/context
+        self.surround = nn.Conv2d(ch, ch, k_surround, padding=k_surround // 2, groups=ch)
+        
+        # 3. Learnable Channel-wise Inhibition Factor (gamma)
+        # Initialized to 1.0. Allows the network to learn the optimal suppression ratio.
+        self.gamma = nn.Parameter(torch.ones(1, ch, 1, 1))
+        
+        # 4. Channel Projection
+        self.proj = nn.Conv2d(ch, ch, 1)
+        
+        # 5. LayerScale for stable integration with YOLO26's Progressive Loss
+        # Initialized to 1e-4 (Identity at start), slowly grows during training.
+        self.layer_scale = nn.Parameter(torch.ones(1, ch, 1, 1) * 1e-4)
+
+    def forward(self, x):
+        # Extract center and surround features
+        f_c = self.center(x)
+        f_s = self.surround(x)
+        
+        # Contrastive Gating: 
+        # If Center > Surround (isolated tiny object) -> Sigmoid > 0.5 (Amplify)
+        # If Surround >= Center (edges, clutter, large objects) -> Sigmoid <= 0.5 (Suppress)
+        contrast = f_c - (self.gamma * f_s)
+        attn = torch.sigmoid(contrast)
+        
+        # Generate attention map
+        attn_map = self.proj(attn)
+        
+        # Apply LayerScale residual (matches YOLO26 training stability)
+        return x + self.layer_scale * (x * attn_map)
+
+
+import torch
+import torch.nn as nn
+
+class LCSAv2(nn.Module):
+    """Local Contrast & Surround Attention (MuSGD-Stable Version).
+    Mathematically bounded and initialized to identity to ensure stable 
+    convergence under YOLO26's native MuSGD optimizer.
+    """
+    def __init__(self, c1, c2=None, kc=3, ks=9, eps=1e-3):
+        super().__init__()
+        ch = c1
+        self.center   = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)
+        self.surround = nn.Conv2d(ch, ch, ks, padding=ks // 2, groups=ch)
+        
+        # Learnable scale (temperature) parameter. Initialized to 0.
+        self.scale = nn.Parameter(torch.zeros(1, ch, 1, 1))
+        self.pw    = nn.Conv2d(ch, ch, 1)
+        self.eps   = eps
+
+        # Sensible init: center = delta, surround = box blur
+        with torch.no_grad():
+            self.center.weight.zero_();  self.center.weight[:, :, kc // 2, kc // 2] = 1.0
+            self.surround.weight.fill_(1.0 / (ks * ks))
+            if self.center.bias is not None:   self.center.bias.zero_()
+            if self.surround.bias is not None: self.surround.bias.zero_()
+            
+            # CRITICAL FIX: Zero-init projection so module starts as exact Identity
+            self.pw.weight.zero_()
+            if self.pw.bias is not None: self.pw.bias.zero_()
+
+    def forward(self, x):
+        c = self.center(x)
+        s = self.surround(x)
+        
+        # FIX 1: Safe Normalized Contrast.
+        # Dividing by |s| explodes on background pixels. Dividing by sum of magnitudes 
+        # strictly bounds the contrast to [-1, 1], preventing gradient explosion.
+        contrast = (c - s) / (torch.abs(c) + torch.abs(s) + self.eps)
+        
+        # FIX 2: Bounded Gating.
+        # Because contrast is bounded, Sigmoid won't instantly saturate to 0 or 1.
+        # Scale starts at 0, so sigmoid(0) = 0.5.
+        gate = torch.sigmoid(self.scale * contrast)
+        
+        # FIX 3: Additive Residual Connection.
+        # Multiplicative attention attenuates gradients. Additive preserves MuSGD momentum.
+        # Because pw is zero-init, the module acts as pure identity at epoch 0.
+        return x + self.pw(c * gate)
+    
+class LCSA(nn.Module):
+    """Local Contrast & Surround Attention.
+    Built for YOLO26's NMS-free one-to-one head on dense tiny objects.
+    Instead of aggregating context (which smooths the spatial response and
+    blurs adjacent objects), it sharpens each location against its local
+    surround via *learnable divisive normalization*, increasing
+    center-vs-neighbor contrast so the one-to-one head can separate crowded
+    objects and the DFL-free head gets sharper localization features.
+    Channel-preserving. Multiplicative output (no LayerScale -> no dead gamma).
+    """
+    def __init__(self, c1, c2=None, kc=3, ks=9, eps=1e-3):
+        super().__init__()
+        ch = c1
+        self.center   = nn.Conv2d(ch, ch, kc, padding=kc // 2, groups=ch)  # local detail
+        self.surround = nn.Conv2d(ch, ch, ks, padding=ks // 2, groups=ch)  # local context
+        self.alpha    = nn.Parameter(torch.ones(1, ch, 1, 1))  # per-channel contrast gain
+        self.pw       = nn.Conv2d(ch, ch, 1)
+        self.eps      = eps
+
+        # Sensible init: center = identity (delta), surround = box blur.
+        # => at step 0 the module computes a normalized high-pass contrast gate
+        #    (a tiny-object / edge emphasizer) and then adapts per channel.
+        with torch.no_grad():
+            self.center.weight.zero_();  self.center.weight[:, :, kc // 2, kc // 2] = 1.0
+            self.surround.weight.fill_(1.0 / (ks * ks))
+            if self.center.bias is not None:   self.center.bias.zero_()
+            if self.surround.bias is not None: self.surround.bias.zero_()
+
+    def forward(self, x):
+        c = self.center(x)
+        s = self.surround(x)
+        contrast = (c - s) / torch.sqrt(s * s + self.eps)   # illumination-invariant local contrast
+        gate = torch.sigmoid(self.alpha * contrast)          # emphasize standout locations, damp flat surround
+        return x * self.pw(c * gate)                         # LKA-style multiplicative coupling
+    
+
+
+class SE(nn.Module):
+    """Squeeze-and-Excitation. Channel attention (the canonical baseline)."""
+    def __init__(self, c1, c2=None, r=16):
+        super().__init__()
+        ch = c1
+        rd = max(ch // r, 8)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(ch, rd, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(rd, ch, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return x * self.fc(x)
+    
+class _ChannelAttn(nn.Module):
+    def __init__(self, ch, r=16):
+        super().__init__()
+        rd = max(ch // r, 8)
+        self.avg = nn.AdaptiveAvgPool2d(1)
+        self.max = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(ch, rd, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(rd, ch, 1, bias=False),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.mlp(self.avg(x)) + self.mlp(self.max(x)))
+
+
+class _SpatialAttn(nn.Module):
+    def __init__(self, k=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, k, padding=k // 2, bias=False)
+
+    def forward(self, x):
+        avg = x.mean(1, keepdim=True)
+        mx, _ = x.max(1, keepdim=True)
+        return torch.sigmoid(self.conv(torch.cat([avg, mx], 1)))
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module (channel + spatial)."""
+    def __init__(self, c1, c2=None, r=16, k=7):
+        super().__init__()
+        self.ca = _ChannelAttn(c1, r)
+        self.sa = _SpatialAttn(k)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
+    
+
+class CoordAtt(nn.Module):
+    """Coordinate Attention. Position-aware channel attention (common in aerial)."""
+    def __init__(self, c1, c2=None, r=32):
+        super().__init__()
+        ch = c1
+        rd = max(ch // r, 8)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.conv1 = nn.Conv2d(ch, rd, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(rd)
+        self.act = nn.Hardswish()
+        self.conv_h = nn.Conv2d(rd, ch, 1, bias=False)
+        self.conv_w = nn.Conv2d(rd, ch, 1, bias=False)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        xh = self.pool_h(x)                       # b,c,h,1
+        xw = self.pool_w(x).permute(0, 1, 3, 2)   # b,c,w,1
+        y = torch.cat([xh, xw], dim=2)            # b,c,h+w,1
+        y = self.act(self.bn1(self.conv1(y)))
+        xh, xw = torch.split(y, [h, w], dim=2)
+        xw = xw.permute(0, 1, 3, 2)
+        ah = torch.sigmoid(self.conv_h(xh))
+        aw = torch.sigmoid(self.conv_w(xw))
+        return x * ah * aw
+
+class SimAM(nn.Module):
+    """SimAM — parameter-free attention. Include it to show a no-param comparator."""
+    def __init__(self, c1=None, c2=None, e_lambda=1e-4):
+        super().__init__()
+        self.e_lambda = e_lambda
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        n = h * w - 1
+        mu = x.mean([2, 3], keepdim=True)
+        d = (x - mu).pow(2)
+        v = d.sum([2, 3], keepdim=True) / n
+        e = d / (4 * (v + self.e_lambda)) + 0.5
+        return x * torch.sigmoid(e)
+    
+class EMA(nn.Module):
+    """Efficient Multi-scale Attention with cross-spatial learning.
+    `factor` = number of groups; channels must be divisible by it and
+    (channels // factor) must be > 0. At P3 in YOLO26n channels are small,
+    so use a small factor (e.g. 8 or 16), NOT the paper's default 32."""
+    def __init__(self, c1, c2=None, factor=8):
+        super().__init__()
+        ch = c1
+        self.groups = factor
+        assert ch % self.groups == 0 and ch // self.groups > 0, \
+            f"channels {ch} not compatible with factor {factor}"
+        g = ch // self.groups
+        self.softmax = nn.Softmax(-1)
+        self.agp = nn.AdaptiveAvgPool2d(1)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(g, g)
+        self.conv1x1 = nn.Conv2d(g, g, 1)
+        self.conv3x3 = nn.Conv2d(g, g, 3, padding=1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        gx = x.reshape(b * self.groups, -1, h, w)          # b*g, c//g, h, w
+        xh = self.pool_h(gx)                                # ., ., h, 1
+        xw = self.pool_w(gx).permute(0, 1, 3, 2)            # ., ., w, 1
+        hw = self.conv1x1(torch.cat([xh, xw], dim=2))
+        xh, xw = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(gx * xh.sigmoid() * xw.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(gx)
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        return (gx * weights.sigmoid()).reshape(b, c, h, w)
+
+
+# ultralytics/nn/modules/block.py  (append near C2PSA)
+# =====================================================================
+# MS-DPRA : Multi-Scale Deformable Pyramid Routing Attention
+# Co-designed with MuSGD: every expressive weight is a 2-D Conv/Linear
+# so Newton-Schulz orthogonalization fires on the parts that matter.
+# LayerNorm / biases / 1-D scalars fall back to the SGD path of MuSGD.
+# =====================================================================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .conv import Conv
+
+
+def _topk_routing(q_r, k_r, topk):
+    """BiFormer-style region-level routing.
+    q_r, k_r : (B, N_r, C) region tokens.
+    Returns index tensor I : (B, N_r, topk)."""
+    aff = torch.einsum("bqc,bkc->bqk", q_r, k_r) / (q_r.shape[-1] ** 0.5)
+    _, idx = aff.topk(topk, dim=-1)          # (B, N_r, topk)
+    return idx
+def _deform_sample(feat, offset, dilation, n_pts):
+    """Deformable sampling via grid_sample (ONNX-exportable)."""
+    B, C, H, W = feat.shape
+    heads = offset.shape[1]
+    head_dim = C // heads  # <-- Calculate head_dim here
+    
+    device = feat.device
+    ys, xs = torch.meshgrid(
+        torch.arange(H, device=device, dtype=feat.dtype),
+        torch.arange(W, device=device, dtype=feat.dtype), indexing="ij")
+    base = torch.stack([xs, ys], dim=0).unsqueeze(0)            
+    
+    dy = offset[:, :, :n_pts] * dilation                        
+    dx = offset[:, :, n_pts:] * dilation
+    
+    g = []
+    for p in range(n_pts):
+        gx = (base[0, 0] + dx[:, :, p]) / max(W - 1, 1) * 2 - 1
+        gy = (base[0, 1] + dy[:, :, p]) / max(H - 1, 1) * 2 - 1
+        g.append(torch.stack([gx, gy], dim=-1))                 
+        
+    grid = torch.stack(g, dim=2)                                
+    grid = grid.view(B * heads, n_pts, H * W, 2)
+    
+    # ---------------------------------------------------------
+    # FIXED: Split feature channels across heads instead of duplicating them!
+    # Old: feat_rep = feat.unsqueeze(1).expand(...).reshape(B * heads, C, H, W)
+    # New: Group the batch and heads, and isolate the head_dim
+    feat_split = feat.view(B * heads, head_dim, H, W)
+    # ---------------------------------------------------------
+
+    sampled = F.grid_sample(feat_split, grid, mode="bilinear",
+                            padding_mode="zeros", align_corners=True)
+                            
+    # sampled is now (B * heads, head_dim, n_pts, H * W)
+    # Reshape and permute to match the (B, h, n_pts, head_dim, H, W) expectation in forward()
+    sampled = sampled.view(B, heads, head_dim, n_pts, H, W)
+    sampled = sampled.permute(0, 1, 3, 2, 4, 5).contiguous()
+    
+    return sampled
+class MSDPRA(nn.Module):
+    """Multi-Scale Deformable Pyramid Routing Attention.
+
+    Drop-in replacement for `Attention` inside PSABlock.
+    Args mirror Attention(c, attn_ratio, num_heads) and add routing/deform knobs.
+    """
+
+    def __init__(self, c, attn_ratio=0.5, num_heads=4,
+                 region_size=7, topk=4, n_pts=4,
+                 dilations=(1, 2, 4, 8)):
+        super().__init__()
+        assert c % num_heads == 0, f"channels {c} not divisible by heads {num_heads}"
+        self.c, self.h = c, num_heads
+        self.region_size, self.topk, self.n_pts = region_size, topk, n_pts
+        self.dilations = tuple(dilations)
+        self.M = len(self.dilations)
+        self.head_dim = c // num_heads
+
+        # ---- 2-D weights -> Muon path in MuSGD ----
+        self.qkv = nn.Conv2d(c, c * 3, 1, bias=False)
+        self.off = nn.Conv2d(c, num_heads * 2 * n_pts, 1, bias=False)
+        self.gate = nn.Conv2d(c, self.M, 1, bias=False)
+        self.proj = nn.Conv2d(c, c, 1, bias=False)
+        # ---- 1-D params -> SGD path in MuSGD ----
+        self.scale = nn.Parameter(torch.ones(self.M))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h, M, n_pts = self.h, self.M, self.n_pts
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=1)                           # each (B,C,H,W)
+        rs = self.region_size
+
+        # --- 1) region-level routing (BiFormer bi-level) ---
+        # pad H,W to multiple of region_size
+        pad_h = (rs - H % rs) % rs
+        pad_w = (rs - W % rs) % rs
+        if pad_h or pad_w:
+            q_r = F.pad(q, (0, pad_w, 0, pad_h))
+            k_r = F.pad(k, (0, pad_w, 0, pad_h))
+        else:
+            q_r, k_r = q, k
+        Hr, Wr = q_r.shape[-2:]
+        Nr = (Hr // rs) * (Wr // rs)
+        # region average pool -> (B, C, Nr)
+        q_rg = F.avg_pool2d(q_r, rs).flatten(2)                 # (B,C,Nr)
+        k_rg = F.avg_pool2d(k_r, rs).flatten(2)
+        # region routing in channel-reshaped space (cheap proxy)
+        with torch.no_grad():
+            aff = q_rg.transpose(1, 2) @ k_rg                   # (B,Nr,Nr)
+            idx = aff.topk(self.topk, dim=-1).indices           # (B,Nr,topk)
+
+        # --- 2) deformable multi-scale sampling ---
+        off = self.off(x)                                       # (B, h*2*n_pts, H, W)
+        off = off.view(B, h, 2 * n_pts, H, W)
+
+        # --- 3) routed + deformed token attention per scale ---
+        q_flat = q.view(B, h, self.head_dim, H * W)             # (B,h,hd,HW)
+        outs = []
+        for m, d in enumerate(self.dilations):
+            samp = _deform_sample(v, off, d, n_pts)             # (B,h,n_pts,C,H,W)
+            # treat each (head, point) as a key/value token stream
+            kv = samp.permute(0, 1, 2, 3, 4, 5).reshape(
+                B, h * n_pts, self.head_dim * (C // self.head_dim // self.head_dim + 1)
+            ) if False else samp.reshape(B, h * n_pts, C, H, W)
+            # simpler & stable: per-head attention against sampled keys
+            k_m = samp.reshape(B, h, n_pts, self.head_dim, H * W)  # (B,h,n_pts,hd,HW)
+            k_m = k_m.permute(0, 1, 2, 4, 3)                       # (B,h,n_pts,HW,hd)
+            attn = torch.einsum("bhdQ,bhnpQ->bhdnp", q_flat, k_m) / (self.head_dim ** 0.5)
+            attn = attn.softmax(dim=-1)
+            v_m = samp.reshape(B, h, n_pts, self.head_dim, H * W).permute(0, 1, 2, 4, 3)
+            y_m = torch.einsum("bhdnp,bhnpQ->bhdQ", attn, v_m)     # (B,h,hd,HW)
+            outs.append(y_m)
+        # --- 4) scale-aware fusion (gate is 2-D conv -> Muon) ---
+        y = torch.stack(outs, dim=2)                              # (B,h,M,hd,HW)
+        g = self.gate(x).softmax(dim=1)                           # (B,M,H,W)
+        g = g.unsqueeze(1).unsqueeze(3)                           # (B,1,M,1,HW)
+        y = (y * g).sum(dim=2)                                    # (B,h,hd,HW)
+        y = y.reshape(B, C, H, W)
+        # --- 5) output projection (2-D conv -> Muon) ---
+        return self.proj(y)
+
+
+class MSDPRABlock(nn.Module):
+    """Drop-in replacement for PSABlock: MSDPRA + FFN + residual.
+    Mirrors PSABlock(c, attn_ratio, num_heads, shortcut) signature."""
+
+    def __init__(self, c, attn_ratio=0.5, num_heads=4, shortcut=True,
+                 region_size=7, topk=4, n_pts=4, dilations=(1, 2, 4, 8)):
+        super().__init__()
+        self.attn = MSDPRA(c, attn_ratio=attn_ratio, num_heads=num_heads,
+                           region_size=region_size, topk=topk,
+                           n_pts=n_pts, dilations=dilations)
+        self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
+        self.add = shortcut
+
+    def forward(self, x):
+        x = x + self.attn(x) if self.add else self.attn(x)
+        x = x + self.ffn(x) if self.add else self.ffn(x)
+        return x
+
+
+class C2MSDPRA(nn.Module):
+    """C2-style wrapper around MSDPRABlock — drop-in replacement for C2PSA."""
+    def __init__(self, c1, c2, n=1, e=0.5):
+        super().__init__()
+        # 1. REMOVE the assert c1 == c2
+        
+        # 2. Base the hidden channels on c2 (the output), not c1
+        self.c = int(c2 * e)  
+        
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        # 3. Ensure final projection goes to c2
+        self.cv2 = Conv(2 * self.c, c2, 1)  
+        
+        self.m = nn.Sequential(*(MSDPRABlock(self.c, attn_ratio=0.5,
+                                             num_heads=max(self.c // 64, 1))
+                                 for _ in range(n)))
+
+    def forward(self, x):
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        b = self.m(b)
+        return self.cv2(torch.cat((a, b), 1))
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TSMA(nn.Module):
+    """Tensor-Spectral Micro-Attention for MuSGD & Tiny Objects."""
+    def __init__(self, c1):
+        super().__init__()
+        # 1. Fixed High-Pass Spectral Isolation (Laplacian/DoG)
+        # Non-optimizable 3D/4D tensor buffer (ignored by MuSGD)
+        k = 3
+        # Laplacian kernel for edge detection (isolates sub-10px boundaries)
+        laplacian_kernel = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32)
+        self.register_buffer('fixed_hp_kernel', laplacian_kernel.view(1, 1, k, k))
+        
+        # 2. MuSGD-Compliant Orthogonal Tensor Projection (4D Conv)
+        # Optimizable >2D parameters, NO bias, NO BatchNorm
+        self.proj = nn.Conv2d(c1, c1, 3, 1, 1, bias=False)
+        self.gate = nn.Conv2d(c1, c1, 1, 1, 0, bias=False) 
+
+    def forward(self, x):
+        # Isolate high-frequency spatial peaks (sub-10px edges) using Depthwise Conv
+        hp = F.conv2d(x, self.fixed_hp_kernel.expand(x.shape[1], -1, -1, -1), padding=1, groups=x.shape[1])
+        
+        # 4D Tensor Projection (Orthogonalized by MuSGD)
+        y = self.proj(hp)
+        y = self.gate(y) 
+        
+        # Additive Isometric Injection (Preserves signal magnitude)
+        return x + y
+
+class C2TSMA(nn.Module):
+    """CSP Bottleneck with TSMA for YOLO26 Tiny Object Detection.
+    Replaces standard C3k2/C2f blocks to preserve microscopic features.
+    """
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.m = nn.Sequential(*(Conv(c_, c_, 3, g=g) for _ in range(n)))
+        # Apply TSMA on the concatenated features before final projection
+        self.tsma = TSMA(2 * c_)
+        self.cv3 = Conv(2 * c_, c2, 1)
+
+    def forward(self, x):
+        y1 = self.m(self.cv1(x))
+        y2 = self.cv2(x)
+        # Fused spatial features are enhanced by TSMA
+        return self.cv3(self.tsma(torch.cat((y1, y2), 1)))
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+from ultralytics.nn.modules.conv import Conv  # Conv2d + BN + SiLU, matches rest of YOLO26
+
+
+class SGCU(nn.Module):
+    """Spectral-Gated Channel Unit. All ops are Conv (ndim>=2) -> every
+    weight is auto-routed to MuSGD's Muon+SGD blend. No free 1D gates."""
+    def __init__(self, c, r=8):
+        super().__init__()
+        cr = max(c // r, 8)
+        self.dw = Conv(c, c, k=3, s=1, g=c, act=True)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc_l1, self.fc_l2 = Conv(c, cr, k=1, act=True), Conv(cr, c, k=1, act=False)
+        self.fc_g1, self.fc_g2 = Conv(c, cr, k=1, act=True), Conv(cr, c, k=1, act=False)
+
+    def forward(self, x):
+        l = self.fc_l2(self.fc_l1(self.pool(self.dw(x))))
+        g = self.fc_g2(self.fc_g1(self.pool(x)))
+        return x * torch.sigmoid(l + g)
+
+
+class StripAttention(nn.Module):
+    """Row/column-decomposed self-attention: O(HW(H+W)C) not O((HW)^2C).
+    The only way attention is computationally viable at P2/P3 resolution."""
+    def __init__(self, c, heads=None):
+        super().__init__()
+        self.heads = heads or max(c // 64, 1)  # same head-sizing convention as C2PSA
+        self.qkv = Conv(c, 3 * c, k=1, act=False)
+        self.proj = Conv(c, c, k=1, act=False)
+
+    @staticmethod
+    def _sdpa(q, k, v):
+        attn = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+        return attn.softmax(dim=-1) @ v
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h, dh = self.heads, C // self.heads
+        q, k, v = self.qkv(x).chunk(3, dim=1)
+        q, k, v = (t.reshape(B, h, dh, H, W) for t in (q, k, v))
+
+        qr, kr, vr = (t.permute(0, 3, 1, 4, 2).reshape(B * H, h, W, dh) for t in (q, k, v))
+        row = self._sdpa(qr, kr, vr).reshape(B, H, h, W, dh).permute(0, 2, 4, 1, 3).reshape(B, C, H, W)
+
+        qc, kc, vc = (t.permute(0, 4, 1, 3, 2).reshape(B * W, h, H, dh) for t in (q, k, v))
+        col = self._sdpa(qc, kc, vc).reshape(B, W, h, H, dh).permute(0, 2, 4, 3, 1).reshape(B, C, H, W)
+
+        return self.proj(row + col)
+
+
+class CSSA(nn.Module):
+    """Cross-Strip Spatial Attention: dilated local context + strip attention."""
+    def __init__(self, c, k=7, d=3):
+        super().__init__()
+        self.local = Conv(c, c, k=k, s=1, g=c, d=d, act=True)
+        self.strip = StripAttention(c)
+        self.merge = Conv(2 * c, c, k=1, act=False)
+
+    def forward(self, x):
+        return x + self.merge(torch.cat([self.local(x), self.strip(x)], dim=1))
+
+
+class MuTOA(nn.Module):
+    """Muon-synchronized Tiny-Object Attention.
+    YAML args: [c2, r]  where c2 = channels (in==out), r = channel reduction (default 8).
+    """
+    def __init__(self, c1, r=8):
+        super().__init__()
+        self.channel = SGCU(c1, r)
+        self.spatial = CSSA(c1)
+
+    def forward(self, x):
+        return self.spatial(self.channel(x))
+    
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.ops import DeformConv2d
+
+class MSCA(nn.Module):
+    """Multi-Scale Spectral-Context Attention.
+    MuSGD-aligned: separate Wq,Wk,Wv,Wo (2-D, Newton-Schulz applies);
+    windowed softmax (well-conditioned grads); minimal 1-D params."""
+    def __init__(self, c, reduction=2, window=4):
+        super().__init__()
+        ch = c // 2
+        self.c, self.ch, self.window = c, ch, window
+        
+        # --- FSE branch ---
+        # FIX 1: padding must be (21-1)*3//2 = 30
+        self.low = nn.Conv2d(ch, ch, 21, padding=30, dilation=3, groups=ch)
+        self.gate = nn.Conv2d(ch, ch, 1)
+        self.gamma = nn.Parameter(torch.ones(1, ch, 1, 1))  # only 1-D param (routed to SGD)
+        
+        # --- DCA branch (SEPARATE 2-D projections -> Muon-friendly) ---
+        self.wq = nn.Conv2d(ch, ch, 1, bias=False)
+        self.wk = nn.Conv2d(ch, ch, 1, bias=False)
+        self.wv = nn.Conv2d(ch, ch, 1, bias=False)
+        self.wo = nn.Conv2d(ch, ch, 1, bias=False)
+        self.dwq = nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
+        self.dwk = nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
+        self.dwv = nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
+        
+        # FIX 2: offset must have 2 * kH * kW channels = 18 for a 3x3 deformable conv
+        self.offset = nn.Conv2d(ch, 2 * 3 * 3, 1)
+        self.deform_conv = DeformConv2d(ch, ch, 3, padding=1, groups=ch, bias=False)
+        
+        # --- GSA ---
+        # FIX 4: sp concatenation outputs 2*c channels
+        self.scale = nn.Conv2d(c * 2, 1, 1)
+        # FIX 5: fuse takes the combined c channels + 1 channel for sg
+        self.fuse  = nn.Conv2d(c + 1, 1, 1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        lo, hi = x[:, :self.ch], x[:, self.ch:]
+        
+        # --- FSE ---
+        low = self.low(lo)
+        high = lo - low
+        gs = torch.sigmoid(self.gate(high))
+        wh = self.gamma * (high * gs - high.mean((2,3),keepdim=True)) / (high.std((2,3),keepdim=True) + 1e-5)
+        
+        # --- DCA ---
+        q = self.dwq(self.wq(hi))
+        k = self.dwk(self.wk(hi))
+        v = self.dwv(self.wv(hi))
+        off = self.offset(q)
+        
+        # Depthwise deformable convolution (groups=ch)
+        vd = self.deform_conv(v, off)
+        
+        # Pad if H or W is not divisible by window size to prevent silent pixel dropping
+        pad_h = (self.window - H % self.window) % self.window
+        pad_w = (self.window - W % self.window) % self.window
+        if pad_h > 0 or pad_w > 0:
+            q = F.pad(q, (0, pad_w, 0, pad_h))
+            k = F.pad(k, (0, pad_w, 0, pad_h))
+            vd = F.pad(vd, (0, pad_w, 0, pad_h))
+            
+        Hp, Wp = q.shape[-2], q.shape[-1]
+        
+        # windowed attention (4x4) -- well-conditioned softmax
+        qf = F.unfold(q, self.window, stride=self.window)            # (B, ch*w*w, L)
+        kf = F.unfold(k, self.window, stride=self.window)
+        vf = F.unfold(vd, self.window, stride=self.window)
+        
+        L = qf.shape[-1]
+        P = self.window * self.window
+        
+        qf = qf.transpose(1, 2).reshape(B, L, self.ch, P)
+        kf = kf.transpose(1, 2).reshape(B, L, self.ch, P)
+        vf = vf.transpose(1, 2).reshape(B, L, self.ch, P)
+        
+        # FIX 3: Correct einsum to compute pixel-to-pixel attention matrix over channels
+        A = torch.einsum('blcp,blcq->blpq', qf, kf) / (self.ch**0.5)
+        A = A.softmax(-1)
+        
+        # Apply attention to values -> (B, L, ch, P)
+        ctx = torch.einsum('blpq,blcq->blcp', A, vf)
+        
+        # Fold back to spatial dimensions
+        ctx = ctx.permute(0, 1, 3, 2).reshape(B, self.ch * P, L)
+        ctx = F.fold(ctx, (Hp, Wp), self.window, stride=self.window)
+        
+        # Crop back to original H, W if we padded
+        ctx = ctx[:, :, :H, :W]
+        ctx = self.wo(ctx)
+        
+        # --- GSA & Residual ---
+        sp = torch.cat([F.avg_pool2d(x, 2), F.max_pool2d(x, 2)], 1)
+        sp = F.interpolate(sp, size=(H, W), mode='nearest')
+        sg = F.softplus(self.scale(sp)) + 0.5
+        
+        # FIX 5: Recombine wh and ctx back to C channels before residual addition
+        combined = torch.cat([wh, ctx], dim=1)
+        alpha = torch.sigmoid(self.fuse(torch.cat([combined, sg], dim=1)))
+        
+        return x + alpha * combined
+
+
+class HFRA(nn.Module):
+    """High-Frequency Resonance Attention (HFRA) with MoL fusion.
+    Uses a frozen Laplacian branch to isolate high-frequency tiny object textures.
+    Uses nn.Linear (2D matrix) for fusion so MuSGD applies Muon orthogonalization.
+    """
+    # FIX: Added 'n: int = 1' as the 3rd argument to intercept the Ultralytics parser
+    def __init__(self, c1: int, c2: int, n: int = 1, k: int = 3, s: int = 1):
+        super().__init__()
+        c_ = c2
+        
+        # Base Semantic Branch
+        self.base_branch = nn.Sequential(
+            DWConv(c1, c_, k, s), 
+            Conv(c_, c_, 1, 1)
+        )
+        
+        # Frozen High-Pass Resonance Branch
+        self.res_branch = nn.Conv2d(c1, c_, k, s, k//2, bias=False)
+        with torch.no_grad():
+            lap = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32)
+            w = lap.view(1, 1, 3, 3).repeat(c_, c1, 1, 1)
+            self.res_branch.weight.data.copy_(w)
+            self.res_branch.weight.requires_grad = False
+
+        # MoL Fusion: nn.Linear ensures MuSGD routes this to Muon optimizer
+        self.fusion = nn.Linear(2 * c_, c2)
+        self.act = nn.Sigmoid()
+        self.add = c1 == c2 and s == 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_base = self.base_branch(x)
+        x_res = self.res_branch(x)
+        
+        # Concatenate and permute for Linear layer [B, H, W, C]
+        x_cat = torch.cat([x_base, x_res], dim=1).permute(0, 2, 3, 1)
+        
+        # Attention generation
+        attn = self.act(self.fusion(x_cat)).permute(0, 3, 1, 2)
+        
+        out = x_base * attn
+        return out + x if self.add else out
+
+class HighFreqInject(nn.Module):
+    """Injects high-frequency spatial details from a higher-resolution feature map (e.g., P2) into a lower-resolution map (e.g., P3)."""
+    def __init__(self, c1, c2):
+        super().__init__()
+        # Laplacian kernel for edge detection (high-pass filter)
+        self.laplacian = nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False)
+        kernel = torch.tensor([[[[0., 1., 0.],
+                                 [1., -4., 1.],
+                                 [0., 1., 0.]]]], dtype=torch.float32)
+        self.laplacian.weight.data = kernel.repeat(c1, 1, 1, 1)
+        self.laplacian.requires_grad_(False) # Fixed high-pass filter
+        
+        # Projection to match target channels
+        self.proj = Conv(c1, c2, 1, 1)
+
+    def forward(self, x):
+        # x is a list: [target_features (P3), source_features (P2)]
+        target, source = x[0], x[1]
+        edges = self.laplacian(source)
+        return target + self.proj(edges)

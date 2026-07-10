@@ -125,13 +125,27 @@ class BboxLoss(nn.Module):
         fg_mask: torch.Tensor,
         imgsz: torch.Tensor,
         stride: torch.Tensor,
+        isrf_pred_dist: torch.Tensor | None = None,  # <-- NEW
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        
+        # --- ISRF Auxiliary Loss ---
+        loss_isrf = torch.tensor(0.0, device=pred_dist.device)
+        if isrf_pred_dist is not None and fg_mask.sum() > 0:
+            # Calculate in raw grid-cell units (before image size normalization)
+            target_ltrb_raw = bbox2dist(anchor_points, target_bboxes)
+            coarse_dist = pred_dist - isrf_pred_dist
+            target_isrf_residual = target_ltrb_raw - coarse_dist.detach() # Detach so gradients only flow to ISRF
+            
+            # Smooth L1 is highly stable for small decimal regressions
+            isrf_loss_raw = F.smooth_l1_loss(isrf_pred_dist[fg_mask], target_isrf_residual[fg_mask], reduction="none")
+            loss_isrf = (isrf_loss_raw.mean(-1, keepdim=True) * weight).sum() / target_scores_sum
+        # ---------------------------
 
-        # DFL loss
+        # DFL loss (or L1 for YOLO26)
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
             loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
@@ -142,15 +156,18 @@ class BboxLoss(nn.Module):
             target_ltrb = target_ltrb * stride
             target_ltrb[..., 0::2] /= imgsz[1]
             target_ltrb[..., 1::2] /= imgsz[0]
-            pred_dist = pred_dist * stride
-            pred_dist[..., 0::2] /= imgsz[1]
-            pred_dist[..., 1::2] /= imgsz[0]
+            
+            # Use a new variable to avoid modifying pred_dist in-place before ISRF loss calculation
+            pred_dist_norm = pred_dist * stride
+            pred_dist_norm[..., 0::2] /= imgsz[1]
+            pred_dist_norm[..., 1::2] /= imgsz[0]
             loss_dfl = (
-                F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
+                F.l1_loss(pred_dist_norm[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
             )
             loss_dfl = loss_dfl.sum() / target_scores_sum
-
-        return loss_iou, loss_dfl
+            
+        # Add ISRF loss to the DFL/L1 slot. Multiplied by 0.5 to balance it.
+        return loss_iou, loss_dfl + loss_isrf * 0.5   
 
 
 class RLELoss(nn.Module):
@@ -225,7 +242,9 @@ class RotatedBboxLoss(BboxLoss):
         fg_mask: torch.Tensor,
         imgsz: torch.Tensor,
         stride: torch.Tensor,
+        isrf_pred_dist: torch.Tensor | None = None,  # <-- NEW (Absorbs argument to prevent crash)
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # ... (Leave the rest of the original RotatedBboxLoss code exactly as is) ...
         """Compute IoU and DFL losses for rotated bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
@@ -395,6 +414,8 @@ class v8DetectionLoss:
             preds["boxes"].permute(0, 2, 1).contiguous(),
             preds["scores"].permute(0, 2, 1).contiguous(),
         )
+
+        isrf_distri = preds["isrf_boxes"].permute(0, 2, 1).contiguous() if "isrf_boxes" in preds else None
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
 
         dtype = pred_scores.dtype
@@ -436,6 +457,7 @@ class v8DetectionLoss:
                 fg_mask,
                 imgsz,
                 stride_tensor,
+                isrf_distri,  # <-- Pass ISRF predictions here
             )
 
         loss[0] *= self.hyp.box  # box gain
@@ -998,6 +1020,7 @@ class v8OBBLoss(v8DetectionLoss):
             preds["scores"].permute(0, 2, 1).contiguous(),
             preds["angle"].permute(0, 2, 1).contiguous(),
         )
+        isrf_distri = preds["isrf_boxes"].permute(0, 2, 1).contiguous() if "isrf_boxes" in preds else None
         anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
 
@@ -1056,6 +1079,7 @@ class v8OBBLoss(v8DetectionLoss):
                 fg_mask,
                 imgsz,
                 stride_tensor,
+                isrf_distri,  # <-- Pass ISRF predictions here
             )
             weight = target_scores.sum(-1)[fg_mask]
             loss[3] = self.calculate_angle_loss(
@@ -1236,86 +1260,3 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion(preds, batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
-
-class DensityAwarev8DetectionLoss(v8DetectionLoss):
-    """Criterion class for computing training losses with density-aware O2O assignment for tiny objects."""
-
-    def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
-        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
-        pred_distri, pred_scores = (
-            preds["boxes"].permute(0, 2, 1).contiguous(),
-            preds["scores"].permute(0, 2, 1).contiguous(),
-        )
-        anchor_points, stride_tensor = make_anchors(preds["feats"], self.stride, 0.5)
-        dtype = pred_scores.dtype
-        batch_size = pred_scores.shape[0]
-        imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
-        
-        # Targets
-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
-        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
-        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
-        
-        # --- YOLO26-Fovea: Dynamic Density-Aware TopK2 Adjustment ---
-        # Calculate the number of valid GTs per image in the batch
-        if hasattr(self.assigner, "topk2"):
-            valid_gt_counts = mask_gt.squeeze(-1).sum(dim=-1)
-            max_density = valid_gt_counts.max().item()
-            
-            # If the image is highly dense (e.g., > 50 tiny objects), increase topk2
-            # This allows the O2O head to output multiple distinct boxes for clustered anchors
-            if max_density > 50:
-                self.assigner.topk2 = max(2, 1 + int(max_density / 50))
-            else:
-                self.assigner.topk2 = 1
-        # -------------------------------------------------------------
-
-        # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
-            pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
-            gt_labels,
-            gt_bboxes,
-            mask_gt,
-        )
-        target_scores_sum = max(target_scores.sum(), 1)
-        
-        # Cls loss
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-        
-        # Bbox loss
-        if fg_mask.sum():
-            loss[0], loss[2] = self.bbox_loss(
-                pred_distri,
-                pred_bboxes,
-                anchor_points,
-                target_bboxes / stride_tensor,
-                target_scores,
-                target_scores_sum,
-                fg_mask,
-                imgsz,
-                stride_tensor,
-            )
-            
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
-        
-        return (
-            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor),
-            loss,
-            loss.detach(),
-        )
-
-class DensityAwareE2ELoss(E2ELoss):
-    """E2E Loss that utilizes the DensityAwarev8DetectionLoss for the One-to-One head."""
-    def __init__(self, model):
-        """Initialize DensityAwareE2ELoss."""
-        # Use standard v8DetectionLoss for One-to-Many (dense supervision)
-        super().__init__(model, loss_fn=v8DetectionLoss)
-        # Override the One-to-One loss with our density-aware version
-        self.one2one = DensityAwarev8DetectionLoss(model, tal_topk=7, tal_topk2=1)
