@@ -1691,8 +1691,8 @@ def parse_model(d, ch, verbose=True):
             args = [c1, *args[1:]]
         # Add this right after the main 'if m in {...}:' block
         elif m is HighFreqInject:
-            c1 = ch[f[1]]  # channels from the high-res source (P2)
-            c2 = args[1]   # target channels (P3)
+            c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
+            c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
             args = [c1, c2]
         elif m is TSMA:  # <--- ADD THIS BLOCK
             c2 = ch[f]
