@@ -1691,10 +1691,9 @@ def parse_model(d, ch, verbose=True):
             args = [c1, *args[1:]]
         # Add this right after the main 'if m in {...}:' block
         elif m is HighFreqInject:
-            c_in1 = ch[f[0]]  # Channels from Target (P3)
-            c_in2 = ch[f[1]]  # Channels from Source (P2)
-            c2 = args[0]      # Output channels (256 from your YAML)
-            args = [c_in1, c2] # Pass the inputs required by the class __init__
+            c1 = ch[f[1]]  # Source channels (from P2) -> Goes to Laplacian
+            c2 = ch[f[0]]  # Target channels (from P3) -> Goes to Projection
+            args = [c1, c2]
         elif m is TSMA:  # <--- ADD THIS BLOCK
             c2 = ch[f]
             args = [c2]
