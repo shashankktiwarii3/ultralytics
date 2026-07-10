@@ -344,14 +344,14 @@ class BaseModel(torch.nn.Module):
             preds = self.forward(batch["img"])
         return self.criterion(preds, batch)
 
-    # def init_criterion(self):
-    #     """Initialize the loss criterion for the BaseModel."""
-    #     raise NotImplementedError("compute_loss() needs to be implemented by task heads")
-
-
     def init_criterion(self):
-        """Initialize the loss criterion for the DetectionModel."""
-        return DensityAwareE2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        """Initialize the loss criterion for the BaseModel."""
+        raise NotImplementedError("compute_loss() needs to be implemented by task heads")
+
+
+    # def init_criterion(self):
+    #     """Initialize the loss criterion for the DetectionModel."""
+    #     return DensityAwareE2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
 class DetectionModel(BaseModel):
