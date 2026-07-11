@@ -77,17 +77,7 @@ from ultralytics.nn.modules import (
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
-# from ultralytics.utils.loss import (
-#     E2ELoss,
-#     PoseLoss26,
-#     v8ClassificationLoss,
-#     v8DetectionLoss,
-#     v8OBBLoss,
-#     v8PoseLoss,
-#     v8SegmentationLoss,
-# )
 from ultralytics.utils.loss import (
-    DensityAwareE2ELoss,
     E2ELoss,
     PoseLoss26,
     v8ClassificationLoss,
@@ -96,6 +86,7 @@ from ultralytics.utils.loss import (
     v8PoseLoss,
     v8SegmentationLoss,
 )
+
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
 from ultralytics.utils.plotting import feature_visualization
