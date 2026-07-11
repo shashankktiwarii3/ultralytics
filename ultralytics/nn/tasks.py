@@ -524,9 +524,13 @@ class DetectionModel(BaseModel):
         y[-1] = y[-1][..., i:]  # small
         return y
 
+    # def init_criterion(self):
+    #     """Initialize the loss criterion for the DetectionModel."""
+    #     return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        return DensityAwareE2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
 
 
 class OBBModel(DetectionModel):
